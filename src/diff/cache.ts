@@ -13,6 +13,10 @@
  * would otherwise return the pre-change findings forever, under an unchanged engine version. The key
  * therefore covers everything the engine consumes that can move its output.
  *
+ * The two emit switches (D54) go in on the same argument, and only when they are off: a diff
+ * computed with `diff.findings: false` carries no findings, and serving that to a caller that asked
+ * for findings would report "no findings" for a pair nobody ever looked at.
+ *
  * The bias is deliberate and one-directional: a false miss costs one recompute, a false hit ships
  * wrong findings. So the configuration is fingerprinted *verbatim* — `ignore` is not sorted or
  * de-duplicated, because its order and multiplicity are visible in the emitted warnings — and a
@@ -46,6 +50,7 @@ import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { SCENARIO_NONE } from '../types.js';
+import { resolvedTolerance } from './tolerance.js';
 import { REPLAY_PAIR, VARIANTLESS_PAIR } from './pairing.js';
 import type {
   PairSources,
@@ -56,6 +61,7 @@ import type {
 import type {
   DiffEngineOptions,
   DiffResult,
+  VisualToleranceOptions,
   PairId,
   PairScenarios,
   RunId,
@@ -68,13 +74,19 @@ import type {
  * `force` is absent on purpose: it selects whether the cache is *consulted*, not what the engine
  * computes, so folding it into the key would make `--force` write an entry nothing can ever read.
  */
-export interface DiffCacheOptions {
+export interface DiffCacheOptions extends VisualToleranceOptions {
   engineVersion: string;
+  /** The finding kinds emitted (D57). Absent means every kind. */
+  kinds?: readonly string[];
   ignore: readonly string[];
   minRegionArea: number;
   maxRegions: number;
   antialiasTolerance: number;
   deviceScaleFactor: number;
+  /** Whether findings were emitted at all (D54). Absent means yes. */
+  emitFindings?: boolean;
+  /** Whether warnings were emitted (D54). Absent means yes. */
+  emitWarnings?: boolean;
 }
 
 /**
@@ -122,7 +134,16 @@ export function diffConfigFingerprint(
 ): string {
   const canonical = JSON.stringify({
     antialiasTolerance: options.antialiasTolerance,
+    ...resolvedTolerance(options),
     deviceScaleFactor: options.deviceScaleFactor,
+    // Written only when a channel is *off* (D54). A diff computed with both channels on — every
+    // diff before the switches existed, and every diff of a project that never touches them — must
+    // key exactly as it did, or adding an off switch nobody uses would invalidate every cache.
+    ...(options.emitFindings === false ? { emitFindings: false } : {}),
+    ...(options.emitWarnings === false ? { emitWarnings: false } : {}),
+    // Same rule as the two switches: written only when the project narrowed the vocabulary, so an
+    // unnarrowed diff keys as it always did (D57). Sorted, because the choice is a set.
+    ...(options.kinds === undefined ? {} : { kinds: [...options.kinds].sort() }),
     ignore: [...options.ignore],
     maxRegions: options.maxRegions,
     minRegionArea: options.minRegionArea,

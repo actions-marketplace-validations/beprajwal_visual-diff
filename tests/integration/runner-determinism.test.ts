@@ -29,6 +29,7 @@ import {
   type RunResult,
 } from '../../src/types.js';
 import { computeDiff } from '../../src/diff/index.js';
+import { decodePng } from '../../src/diff/pixel.js';
 import { loadConfigOrThrow, openStore, paths } from '../../src/store/index.js';
 import { runFlow } from '../../src/runner/index.js';
 
@@ -278,4 +279,137 @@ describe('the determinism harness', () => {
     }
     expect(typeof hasChromium).toBe('boolean');
   });
+});
+
+/* ------------------------------------------------------------------ the mask paint (D55) */
+
+const MAGENTA: readonly [number, number, number] = [255, 0, 255];
+
+/** Whether any pixel of a screenshot is exactly this colour. */
+async function paints(file: string, [r, g, b]: readonly [number, number, number]): Promise<boolean> {
+  const image = decodePng(await readFile(file));
+  for (let i = 0; i < image.data.length; i += 4) {
+    if (image.data[i] === r && image.data[i + 1] === g && image.data[i + 2] === b) return true;
+  }
+  return false;
+}
+
+describeIfBrowser('capture switches', () => {
+  it('skips the accessibility snapshot and the two diagnostics it was told to skip', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'vdiff-capture-'));
+    try {
+      await mkdir(paths.flowsDir(root), { recursive: true });
+      await writeFile(
+        paths.configFile(root),
+        `${CONFIG}capture:\n  a11y: false\n  console: false\n  network: false\n`,
+        'utf8',
+      );
+      await writeFile(paths.flowFile(root, 'demo'), FLOW, 'utf8');
+      await writeFile(join(root, 'server.mjs'), SERVER, 'utf8');
+      await writeFile(join(root, 'index.html'), HTML, 'utf8');
+
+      const run = await runFlow({ flow: 'demo', cwd: root });
+      expect(run.meta.status).toBe('ok');
+      // What the run says it did not collect, so a later diff can tell "nothing happened" from
+      // "nobody recorded it".
+      expect(run.meta.captured).toEqual({ a11y: false, console: false, network: false });
+
+      const stepDir = join(run.runDir, 'steps/cart');
+      expect(existsSync(join(stepDir, 'console.json'))).toBe(false);
+      expect(existsSync(join(stepDir, 'network.json'))).toBe(false);
+
+      // The a11y file is still written, holding the empty snapshot: the shot manifest names it, and
+      // a path that points at nothing is worse than one that points at "not captured".
+      const a11y = JSON.parse(
+        await readFile(join(stepDir, '400x300/a11y.json'), 'utf8'),
+      ) as A11ySnapshot;
+      expect(a11y.root).toBeNull();
+
+      // And the pictures are exactly the pictures: nothing about capture changes the comparison.
+      const dom = JSON.parse(
+        await readFile(join(stepDir, '400x300/dom.json'), 'utf8'),
+      ) as DomSnapshot;
+      expect(dom.nodes.length).toBeGreaterThan(5);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
+describeIfBrowser('browser.mask: false', () => {
+  it('captures the page unpainted, and two replays still find nothing', async () => {
+    // The whole design of D56 in one test. The fixture paints `performance.now()` into a masked
+    // element, so with nothing covering it the two shots genuinely differ there — and the diff has
+    // to reach zero anyway, off the mask rects alone. If it does not, turning the paint off has
+    // traded a magenta bar for a permanent 0.x% "changed" on every pull request.
+    const root = await mkdtemp(join(tmpdir(), 'vdiff-nomask-'));
+    try {
+      await mkdir(paths.flowsDir(root), { recursive: true });
+      await writeFile(paths.configFile(root), `${CONFIG}browser:\n  mask: false\n`, 'utf8');
+      await writeFile(paths.flowFile(root, 'demo'), FLOW, 'utf8');
+      await writeFile(join(root, 'server.mjs'), SERVER, 'utf8');
+      await writeFile(join(root, 'index.html'), HTML, 'utf8');
+
+      const one = await runFlow({ flow: 'demo', cwd: root });
+      const two = await runFlow({ flow: 'demo', cwd: root });
+      expect(one.meta.status).toBe('ok');
+      expect(two.meta.status).toBe('ok');
+
+      // Nothing was painted: no magenta, and the masked selectors are still recorded, because the
+      // rects are what the diff excludes.
+      const shot = join(one.runDir, 'steps/cart/400x300/screenshot.png');
+      expect(await paints(shot, MAGENTA)).toBe(false);
+      const dom = JSON.parse(
+        await readFile(join(one.runDir, 'steps/cart/400x300/dom.json'), 'utf8'),
+      ) as DomSnapshot;
+      expect(dom.masks).toHaveLength(1);
+
+      const diff = await computeDiff(one.runDir, two.runDir, {
+        minRegionArea: 64,
+        maxRegions: 40,
+        antialiasTolerance: 0.1,
+        ignore: [],
+        engineVersion: DIFF_ENGINE_VERSION,
+        deviceScaleFactor: 2,
+      });
+
+      expect(diff.summary.totalFindings).toBe(0);
+      expect(diff.summary.stepsChanged).toBe(0);
+      expect(diff.summary.maxPixelChangedRatio).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
+describeIfBrowser('browser.maskColor', () => {
+  it('paints the mask magenta unless the project names a colour, and then paints that', async () => {
+    // Magenta by default: a redaction bar nobody can mistake for the UI. The fixture's own palette
+    // has no magenta in it, so finding one means the mask painted it.
+    const shot = (dir: string): string => join(dir, 'steps/cart/400x300/screenshot.png');
+    expect(await paints(shot(first.runDir), MAGENTA)).toBe(true);
+
+    // The same flow with `browser.maskColor: white`, which is this fixture's page background: the
+    // masked counter is still frozen — the whole point of the mask — and the screenshot reads as a
+    // picture of the product rather than of a redaction (D55).
+    const painted = await mkdtemp(join(tmpdir(), 'vdiff-maskcolour-'));
+    try {
+      await mkdir(paths.flowsDir(painted), { recursive: true });
+      await writeFile(
+        paths.configFile(painted),
+        `${CONFIG}browser:\n  maskColor: white\n`,
+        'utf8',
+      );
+      await writeFile(paths.flowFile(painted, 'demo'), FLOW, 'utf8');
+      await writeFile(join(painted, 'server.mjs'), SERVER, 'utf8');
+      await writeFile(join(painted, 'index.html'), HTML, 'utf8');
+
+      const white = await runFlow({ flow: 'demo', cwd: painted });
+      expect(white.meta.status).toBe('ok');
+      expect(await paints(shot(white.runDir), MAGENTA)).toBe(false);
+      expect(await paints(shot(white.runDir), [255, 255, 255])).toBe(true);
+    } finally {
+      await rm(painted, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

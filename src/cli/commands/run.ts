@@ -23,7 +23,8 @@ import {
   type RunWarning,
 } from '../../types.js';
 import type { CommandContext, CommandResult } from '../command.js';
-import type { Invocation } from '../args.js';
+import { durationToMs, type Invocation } from '../args.js';
+import { configError } from '../error.js';
 import { formatLogTail, readLogTail } from '../log.js';
 import { table } from '../output.js';
 import { identitySuffix, variantOf, VARIANT_NONE, type VariantName } from '../variant.js';
@@ -60,6 +61,29 @@ function describeWarning(warning: RunWarning): string {
   return `${warning.kind}: ${warning.message}${rules}${steps}${urls}`;
 }
 
+/** An environment value that was set to something. `VDIFF_BASE_URL=` in a workflow is unset. */
+function nonEmpty(value: string | undefined): string | undefined {
+  return value !== undefined && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function isTruthy(value: string | undefined): boolean {
+  return value !== undefined && /^(1|true|yes)$/i.test(value.trim());
+}
+
+/** `VDIFF_STEP_TIMEOUT=90s` → ms. Unset or empty is unset; a malformed value is a config error. */
+function envDuration(value: string | undefined): number | undefined {
+  const raw = nonEmpty(value);
+  if (raw === undefined) return undefined;
+  const ms = durationToMs(raw);
+  if (ms === null) {
+    throw configError(
+      'invalid-duration',
+      `VDIFF_STEP_TIMEOUT '${raw}' needs a unit: 60s, 2m, 1500ms`,
+    );
+  }
+  return ms;
+}
+
 export async function run(
   ctx: CommandContext,
   invocation: RunInvocation,
@@ -79,6 +103,20 @@ export async function run(
   // Only sent when asked for: `keep: false` on every ordinary run would read as a decision the
   // caller made about retention, and they made no such decision.
   if (invocation.keep) options.keep = true;
+
+  // CI overrides (CI spec D41): the flag wins, the environment is the fallback, the file is the
+  // default. Read from the environment because the composite action calls `vdiff run` with no
+  // flags, and a runner that fronts the app on another origin sets these once for the whole job.
+  const env = ctx.env ?? process.env;
+  const baseUrl = invocation.baseUrl ?? nonEmpty(env['VDIFF_BASE_URL']);
+  if (baseUrl !== undefined) options.baseUrl = baseUrl;
+  const readyOn = invocation.readyOn ?? nonEmpty(env['VDIFF_READY_ON']);
+  if (readyOn !== undefined) options.readyOn = readyOn;
+  if (invocation.ignoreHttpsErrors === true || isTruthy(env['VDIFF_IGNORE_HTTPS_ERRORS'])) {
+    options.ignoreHTTPSErrors = true;
+  }
+  const stepTimeout = invocation.stepTimeoutMs ?? envDuration(env['VDIFF_STEP_TIMEOUT']);
+  if (stepTimeout !== undefined) options.stepTimeoutMs = stepTimeout;
 
   const result = await ctx.ports.runFlow(options);
   const { meta, steps } = result;
@@ -107,6 +145,17 @@ export async function run(
 
   const failed = steps.filter((step) => step.status === 'failed');
   const blocked = steps.filter((step) => step.status === 'blocked');
+
+  // Why each step failed, right under the table. In CI this line is the whole diagnosis: the run
+  // directory with the failure screenshot is on a runner nobody can open, and "pay-form
+  // failed" alone sends the reader to download an artifact to learn it was a selector timeout.
+  for (const step of failed) {
+    const failure = step.failure;
+    if (failure === undefined) continue;
+    const where = failure.selector === undefined ? '' : ` (${failure.verb ?? 'step'} ${failure.selector})`;
+    human.push(`  ${step.id} failed${where}: ${failure.message.split('\n')[0]}`);
+    if (failure.screenshot !== undefined) human.push(`    screenshot: ${failure.screenshot}`);
+  }
   // A mock-only run has no recording, so "har 0 hit" would be a true sentence that reads as a
   // failure. Report what the mode actually produces: rules served, requests missed (D13).
   // `harHits` is necessarily 0 under `mock` — nothing consulted a recording, because there is no

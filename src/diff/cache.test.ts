@@ -72,6 +72,18 @@ describe('pairId / diffDirFor', () => {
 });
 
 describe('diffCacheKey', () => {
+  it('enables the same tolerance defaults for direct engine callers', () => {
+    expect(defaultDiffOptions().maxChangedPixelRatio).toBe(0.003);
+    expect(defaultDiffOptions().layout).toEqual({ enabled: true, tolerancePx: 2 });
+  });
+
+  it('invalidates cached results when either tolerance control changes', () => {
+    const original = diffConfigFingerprint(options());
+    expect(diffConfigFingerprint(options({ maxChangedPixelRatio: 0 }))).not.toBe(original);
+    expect(diffConfigFingerprint(options({ layout: { enabled: true, tolerancePx: 0.5 } }))).not.toBe(original);
+    expect(diffConfigFingerprint(options({ layout: { enabled: false } }))).not.toBe(original);
+  });
+
   it('carries the pair, the engine version and a configuration fingerprint', () => {
     const key = diffCacheKey(BASE, HEAD, options());
     expect(key.startsWith(`0003..0007@${DIFF_ENGINE_VERSION}#`)).toBe(true);
@@ -96,6 +108,38 @@ describe('diffCacheKey', () => {
       engineVersion: '1',
     };
     expect(diffCacheKey(BASE, HEAD, a)).toBe(diffCacheKey(BASE, HEAD, b));
+  });
+
+  it('keys a diff computed with a channel off apart from one computed with both on', () => {
+    const both = options();
+    expect(diffCacheKey(BASE, HEAD, { ...both, emitFindings: false })).not.toBe(
+      diffCacheKey(BASE, HEAD, both),
+    );
+    expect(diffCacheKey(BASE, HEAD, { ...both, emitWarnings: false })).not.toBe(
+      diffCacheKey(BASE, HEAD, both),
+    );
+    expect(diffCacheKey(BASE, HEAD, { ...both, emitFindings: false })).not.toBe(
+      diffCacheKey(BASE, HEAD, { ...both, emitWarnings: false }),
+    );
+  });
+
+  it('keys a narrowed vocabulary apart, and an unnarrowed one as before', () => {
+    const all = options();
+    expect(diffCacheKey(BASE, HEAD, { ...all, kinds: ['content', 'style'] })).not.toBe(
+      diffCacheKey(BASE, HEAD, all),
+    );
+    // A set, not a list: the same choice written in another order is the same key.
+    expect(diffCacheKey(BASE, HEAD, { ...all, kinds: ['style', 'content'] })).toBe(
+      diffCacheKey(BASE, HEAD, { ...all, kinds: ['content', 'style'] }),
+    );
+  });
+
+  it('keys both channels on exactly as it did before the switches existed', () => {
+    // Adding an off switch nobody uses must not invalidate a single stored diff (D54).
+    const both = options();
+    expect(diffCacheKey(BASE, HEAD, { ...both, emitFindings: true, emitWarnings: true })).toBe(
+      diffCacheKey(BASE, HEAD, both),
+    );
   });
 
   it('ignores `force`, which selects whether the cache is consulted, not what is computed', () => {

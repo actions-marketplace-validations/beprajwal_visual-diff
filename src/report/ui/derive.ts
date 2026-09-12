@@ -21,7 +21,7 @@ import type {
   ViewportDiff,
   ViewportId,
 } from '../../types.js';
-import { SCENARIO_NONE, SEVERITIES, SEVERITY_ORDER } from '../../types.js';
+import { FINDING_KINDS, SCENARIO_NONE, SEVERITIES, SEVERITY_ORDER } from '../../types.js';
 import { describeRuleHit, type StepAttribution } from '../attribution.js';
 import {
   classifySourcePair,
@@ -62,6 +62,7 @@ export type CellVariant =
   | 'removed'
   | 'spec-changed'
   | 'changed'
+  | 'within-tolerance'
   | 'identical';
 
 export interface FilmstripCell {
@@ -138,7 +139,11 @@ export function viewportDiffOf(
  * the step-scoped ones (console, network), which have no viewport of their own and must not vanish
  * when a viewport tab is selected.
  */
-export function findingsForStep(step: StepDiff | undefined, viewport: ViewportId | null): Finding[] {
+export function findingsForStep(
+  step: StepDiff | undefined,
+  viewport: ViewportId | null,
+  showMinorChanges = true,
+): Finding[] {
   if (!step) return [];
   const out: Finding[] = [];
   if (viewport === null) {
@@ -151,7 +156,7 @@ export function findingsForStep(step: StepDiff | undefined, viewport: ViewportId
     if (vd) out.push(...vd.findings);
   }
   out.push(...step.findings);
-  return out;
+  return showMinorChanges ? out : out.filter((finding) => finding.withinTolerance !== true);
 }
 
 /** Sorts by severity, then by kind, then by id, so the list order is stable across renders. */
@@ -188,7 +193,16 @@ export function topSeverity(findings: readonly Finding[]): Severity | null {
   return best;
 }
 
-function variantFor(status: FlowDiffStatus, findingsCount: number, ratio: number): CellVariant {
+/**
+ * The cell's variant.
+ *
+ * A matched step is `identical` when its pixels are: the badge answers "did this render
+ * differently?", and a step with a new console error and two indistinguishable frames renders
+ * identically (D53). The finding is still in the panel and still counted on the cell — it is simply
+ * not what makes the frame read as changed. Every other status has its own variant already, so a
+ * structural finding never loses its badge to this rule.
+ */
+function variantFor(status: FlowDiffStatus, pixelMoved: boolean): CellVariant {
   switch (status) {
     case 'failed':
       return 'failed';
@@ -201,7 +215,7 @@ function variantFor(status: FlowDiffStatus, findingsCount: number, ratio: number
     case 'spec-changed':
       return 'spec-changed';
     case 'matched':
-      return findingsCount === 0 && ratio === 0 ? 'identical' : 'changed';
+      return pixelMoved ? 'changed' : 'identical';
     default:
       return 'changed';
   }
@@ -219,6 +233,8 @@ function badgeFor(variant: CellVariant, findingsCount: number): string {
       return '−';
     case 'identical':
       return '=';
+    case 'within-tolerance':
+      return '≈';
     case 'spec-changed':
       return findingsCount > 0 ? String(findingsCount) : '≠';
     case 'changed':
@@ -228,17 +244,34 @@ function badgeFor(variant: CellVariant, findingsCount: number): string {
 }
 
 /** Builds one cell per aligned step, in display order. */
-export function buildFilmstrip(diff: DiffResult, viewport: ViewportId | null): FilmstripCell[] {
+export function buildFilmstrip(
+  diff: DiffResult,
+  viewport: ViewportId | null,
+  showMinorChanges = true,
+): FilmstripCell[] {
   const byId = new Map<StepId, StepDiff>();
   for (const step of diff.steps) byId.set(step.id, step);
 
   return alignFlowDiff(diff.flowDiff).map((entry, order) => {
     const step = byId.get(entry.id);
-    const findings = findingsForStep(step, viewport);
+    const allFindings = findingsForStep(step, viewport);
+    const findings = showMinorChanges
+      ? allFindings
+      : allFindings.filter((finding) => finding.withinTolerance !== true);
     const vd = viewportDiffOf(step, viewport);
     const ratio = vd ? vd.pixelChangedRatio : 0;
     const status = step?.status ?? entry.status;
-    const variant = variantFor(status, findings.length, ratio);
+    // A dimension change counts: the image is a different size, which is a visual change even when
+    // every pixel of the common area matched.
+    const pixelMoved = ratio > 0 || (vd?.dimensionsChanged ?? false);
+    // A tolerated viewport must not hide a step-level console/network finding. Classification
+    // uses the complete evidence so toggling the list cannot change what the cell means.
+    const minor =
+      vd?.withinTolerance === true &&
+      allFindings.every((finding) => finding.withinTolerance === true) &&
+      (pixelMoved || allFindings.length > 0);
+    const variant =
+      status === 'matched' && minor ? 'within-tolerance' : variantFor(status, pixelMoved);
     return {
       id: entry.id,
       status,
@@ -261,11 +294,15 @@ export function buildFilmstrip(diff: DiffResult, viewport: ViewportId | null): F
 export function visibleCells(
   cells: readonly FilmstripCell[],
   findingsOnly: boolean,
+  showMinorChanges = true,
 ): FilmstripCell[] {
-  if (!findingsOnly) return cells.slice();
-  const filtered = cells.filter((c) => c.findingsCount > 0 || c.variant === 'failed');
-  // Never filter down to nothing: an empty strip has no navigation affordance at all.
-  return filtered.length > 0 ? filtered : cells.slice();
+  const eligible = showMinorChanges
+    ? cells.slice()
+    : cells.filter((cell) => cell.variant !== 'within-tolerance');
+  if (!findingsOnly) return eligible;
+  const filtered = eligible.filter((c) => c.findingsCount > 0 || c.variant === 'failed');
+  // Keep the existing findings-only fallback, without bringing deliberately hidden minors back.
+  return filtered.length > 0 ? filtered : eligible;
 }
 
 /** Every viewport present in the diff, in the head run's declared order. */
@@ -760,6 +797,24 @@ export function unavailableKindNote(diff: DiffResult | null, kind: string): stri
  */
 export function degradedLayerNotes(diff: DiffResult | null): string[] {
   const notes: string[] = [];
+  // A channel the project turned off is the same hazard as a layer the capture could not run
+  // (D54): the rail is where a reader decides the tool found nothing, and "no findings" must not
+  // stand in for "nobody looked". First, because it applies to every step at once.
+  if (diff !== null && diff.emit !== undefined && !diff.emit.findings) {
+    notes.push(
+      'findings: turned off for this diff (diff.findings: false), so this report shows the pixel' +
+        ' diff and nothing else',
+    );
+  }
+  // A kind the project excluded (D57) is empty for the same reason a trace's style layer is: it was
+  // never looked at. Named individually, because the reader's question is per-kind.
+  if (diff !== null && diff.emit?.kinds !== undefined) {
+    const allowed = diff.emit.kinds;
+    for (const kind of FINDING_KINDS) {
+      if (allowed.includes(kind)) continue;
+      notes.push(`${kind}: not looked for in this diff (diff.kinds excludes it)`);
+    }
+  }
   if (isPixelsOnlyPair(diff)) notes.push(PIXELS_ONLY_ATTRIBUTION_NOTE);
   for (const [kind, entry] of [...DEGRADED_KIND_NOTES, ...PIXELS_ONLY_KIND_NOTES]) {
     const note = unavailableKindNote(diff, kind);

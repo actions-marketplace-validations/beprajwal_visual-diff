@@ -14,6 +14,8 @@ import type {
   FeedbackEntry,
   PairLabel,
   PairRef,
+  Review,
+  ReviewProvider,
   RunId,
   RunSummary,
   ScenarioName,
@@ -27,7 +29,7 @@ import type {
   InstallTargetId,
   TargetKind,
 } from '../adapters/index.js';
-import type { GateVerdict } from './ci.js';
+import type { GateVerdict, HtmlMode } from './ci.js';
 import type { SourcePair } from './e2e.js';
 import type { E2eIngestPlan, E2eIngestReport } from './ports.js';
 import type { VariantPair } from './variant.js';
@@ -143,6 +145,8 @@ export interface DiffData {
  */
 export interface CommentData {
   flow: string;
+  /** Complete comparison with no changes above tolerance, suitable for a grouped CI summary. */
+  unchanged: boolean;
   pair: PairRef;
   markdown: string;
   /** The HTML comment an upserting transport searches for (D33). Always the first line of `markdown`. */
@@ -150,8 +154,10 @@ export interface CommentData {
   bytes: number;
   /** Image groups rendered. Zero whenever no `--image-base` was given — GitHub cannot serve one (D31). */
   images: number;
+  /** Whether the comment opens with the picture of the report (D51). */
+  preview: boolean;
   /** What did not fit in the body, so a caller can log it rather than discover it (D33). */
-  truncated: { findings: number; images: number; steps: boolean };
+  truncated: { images: number; steps: boolean };
   /** Absolute path written by `--out`; null when the markdown went to stdout only. */
   path: string | null;
   /** The gate that was evaluated. `level: 'none'` — the default — never trips (D30). */
@@ -172,6 +178,8 @@ export interface ExportData {
   files: string[];
   /** Image files copied. Counts files, not cells: one cell is up to three of them. */
   images: number;
+  /** How `report.html` addresses those images — and whether a self-contained page was written. */
+  html: HtmlMode;
   /**
    * Sources that were expected and absent — a pruned run has no screenshots, and a step with no
    * base side has no pixel diff. Reported rather than repaired: inventing an image would be worse.
@@ -182,6 +190,36 @@ export interface ExportData {
   notices: string[];
   /** The bundle's own `comment.md`, rendered with bundle-relative image paths. */
   comment: { path: string; bytes: number };
+  /**
+   * The captures of the report page (D51), bundle-relative, when `--preview` was asked for and a
+   * browser was there to take them; `[]` otherwise, with the reason among the warnings.
+   */
+  preview: string[];
+  result: DiffResult;
+}
+
+/**
+ * `vdiff review <flow> [base] [head]` — a model's reading of the pair, persisted beside its
+ * `findings.json` (CI spec D39). The review itself is the payload; the rest says what it cost.
+ */
+export interface ReviewData {
+  flow: string;
+  pair: PairRef;
+  review: Review;
+  /** Absolute path of the stored `review.json`. */
+  path: string;
+  /** Absolute path written by `--out`, when one was; null otherwise. */
+  out: string | null;
+  provider: ReviewProvider;
+  model: string;
+  /** Images attached to the request. Zero under `--shots 0` or when no screenshot was on disk. */
+  images: number;
+  /** Provider-reported token counts; null when the response did not carry them. */
+  usage: { inputTokens: number | null; outputTokens: number | null };
+  /** True when `--context` supplied a description of the intended change. */
+  contextProvided: boolean;
+  /** The changes the model flagged as `unrelated` or `regression` — what a caller would warn on. */
+  flagged: number;
   result: DiffResult;
 }
 

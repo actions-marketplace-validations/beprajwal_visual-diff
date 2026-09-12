@@ -50,6 +50,7 @@ describe('flow vocabulary (spec §6, D8)', () => {
       'fill',
       'press',
       'hover',
+      'upload',
       'scroll',
       'waitFor',
       'viewport',
@@ -203,7 +204,10 @@ describe('defaults (spec §6, §7, §12)', () => {
   });
 
   it('exposes a diff engine version usable as part of the cache key', () => {
-    expect(DIFF_ENGINE_VERSION).toBe('1');
+    // '3': the pixel gate (D53) changed what the engine emits, and the excluded-aware pixel count
+    // (D56) changed the number it reports, so a diff computed under either older version has to
+    // stop being reused.
+    expect(DIFF_ENGINE_VERSION).toBe('4');
     expect(typeof DIFF_ENGINE_VERSION).toBe('string');
   });
 });

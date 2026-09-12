@@ -55,6 +55,7 @@ export const STEP_VERBS = [
   'fill',
   'press',
   'hover',
+  'upload',
   'scroll',
   'waitFor',
   'viewport',
@@ -95,6 +96,13 @@ export interface Step {
   fill?: Record<string, string>;
   press?: string;
   hover?: string;
+  /**
+   * Attach files: selector → one path or several, relative to `.visual-diff/` (a committed
+   * `fixtures/` directory, by convention). The selector may be the `<input type=file>` itself or
+   * the button that opens the file dialog; the replayer handles both. What lets a flow *create* the
+   * state it captures — a document still parsing — instead of pointing at data that has to exist.
+   */
+  upload?: Record<string, string | string[]>;
   scroll?: ScrollAction;
   /** Switch the viewport for this step onward within the current context. */
   viewport?: ViewportId;
@@ -337,14 +345,64 @@ export interface AppConfig {
   /** URL probed for readiness; $PORT is substituted. */
   readyOn: string;
   readyTimeoutMs: number;
+  /**
+   * Per-action timeout inside a step — a `goto`, a `click`, a `waitFor`. Absent means the runner's
+   * default (15s), which suits a warm dev server; a cold `next dev` compiling a route on first hit
+   * needs more, and CI is always cold.
+   */
+  stepTimeoutMs?: number;
 }
 
-export interface DiffConfig {
+export interface VisualToleranceOptions {
+  /** Allowed unexplained changed pixels / compared area. Inclusive; default 0.003 (0.3%). */
+  maxChangedPixelRatio?: number;
+  /** Geometry uses CSS pixels. Defaults: enabled, 2px. */
+  layout?: { enabled?: boolean; tolerancePx?: number };
+}
+
+export interface DiffConfig extends VisualToleranceOptions {
   minRegionArea: number;
   maxRegions: number;
   antialiasTolerance: number;
   /** Selectors whose rects are excluded from regions and findings. */
   ignore: string[];
+  /**
+   * Emit findings at all (D54). False turns the whole findings channel off: the pixel diff, the
+   * regions and the overlays are still computed and stored, and `findings.json` carries no
+   * findings. For a project that wants the pictures and nothing else.
+   */
+  findings: boolean;
+  /** Emit `DiffResult.warnings` (D54). False stores an empty list. */
+  warnings: boolean;
+  /**
+   * The finding kinds this project wants (D57). Every kind by default; a written list is an
+   * allowlist, and a kind left out is never emitted.
+   *
+   * This is the scalpel next to `findings: false`. The usual reason to reach for the blunt switch
+   * is one channel: two replays against a shared backend differ in their console and their network
+   * traffic for reasons that have nothing to do with the change under review. Dropping *those two*
+   * keeps the layout, style, content and accessibility findings, which no amount of backend noise
+   * can manufacture.
+   */
+  kinds: FindingKind[];
+}
+
+/**
+ * What every run collects (D58). All three default to true.
+ *
+ * Two different reasons to turn one off. `a11y` is cost: an accessibility snapshot is a round trip
+ * per shot per viewport, and *nothing reads the file* — the accessibility findings come from the
+ * roles and names in `dom.json`, so the snapshot is an archive for a human, not an input to the
+ * diff. `console` and `network` are noise at the source: a project whose replays talk to a shared
+ * backend can stop recording traffic it has already decided not to compare.
+ *
+ * Turning `console` or `network` off does **not** touch HAR record/replay or the hit/miss
+ * accounting: those are how a replay is served, not a diagnostic written beside it.
+ */
+export interface CaptureConfig {
+  a11y: boolean;
+  console: boolean;
+  network: boolean;
 }
 
 export interface NetworkConfigFile {
@@ -373,6 +431,30 @@ export interface RetentionConfig {
  */
 export interface BrowserConfig {
   storageState?: string;
+  /**
+   * Accept a certificate the browser would reject — a CI proxy with `tls internal` fronting the
+   * dev server so the app is same-site with a real auth domain. Applies to the readiness probe
+   * too, because a probe that refuses the certificate never sees the server it is waiting for.
+   */
+  ignoreHTTPSErrors?: boolean;
+  /**
+   * The solid colour a flow `mask` paints over its selectors before capture (D55). Any CSS colour
+   * Playwright accepts; magenta by default, because a redaction bar should be impossible to
+   * mistake for the UI. A project whose reviewers read these screenshots as pictures of the
+   * product rather than as evidence can set the page's own background instead, and the masked box
+   * disappears into it — what matters to the diff is only that both sides paint the same colour.
+   */
+  maskColor?: string;
+  /**
+   * Whether a flow `mask` paints anything at all (D56). True by default. False captures the page
+   * as it renders — no rectangle, no colour to choose — and the masked selectors keep doing the
+   * one job that cannot be given up: their rects are excluded from the changed-pixel count, the
+   * regions and the findings, so a clock that ticks between two runs still says nothing.
+   *
+   * `maskColor` means nothing when this is false, and the config refuses the pair rather than
+   * letting one of them look effective.
+   */
+  mask?: boolean;
 }
 
 export interface Config {
@@ -384,6 +466,7 @@ export interface Config {
   baseUrl?: string;
   app: AppConfig;
   browser?: BrowserConfig;
+  capture: CaptureConfig;
   diff: DiffConfig;
   network: NetworkConfigFile;
   retention: RetentionConfig;
@@ -504,6 +587,15 @@ export interface RunMeta {
    * `meta.json` files read back unchanged; absent means an anonymous run.
    */
   authenticated?: boolean;
+  /**
+   * What this run did *not* collect (D58), written only when something was off; an absent field
+   * means it was collected, which is what every run before the switches existed did.
+   *
+   * On the run rather than only in config, because the diff reads two runs and neither one's
+   * configuration is a fact about the other: comparing a run that recorded its console against one
+   * that did not would otherwise report every console line as resolved.
+   */
+  captured?: { a11y?: boolean; console?: boolean; network?: boolean };
   env: RunEnv;
   startedAt: IsoDate;
   finishedAt: IsoDate;
@@ -815,6 +907,8 @@ export interface FindingElement {
 }
 
 export interface Finding {
+  /** Retained in detailed reports, omitted from significant-change summaries. */
+  withinTolerance?: boolean;
   /** "f1", "f2", ... unique within one DiffResult. */
   id: string;
   kind: FindingKind;
@@ -856,6 +950,11 @@ export interface FlowDiffEntry {
 }
 
 export interface ViewportDiff {
+  /** PR-facing measurements with tolerated geometry removed. Raw measurements remain intact. */
+  significantPixelChangedRatio?: number;
+  significantDimensionsChanged?: boolean;
+  /** A measured visual change with no change exceeding the configured tolerances. */
+  withinTolerance?: boolean;
   viewport: ViewportId;
   pixelChangedRatio: number;
   baseSize: Size | null;
@@ -924,6 +1023,8 @@ export interface PairScenarios {
 
 /** findings.json */
 export interface DiffResult {
+  /** Effective tolerance policy; absent on strict/legacy comparisons. */
+  tolerance?: VisualToleranceOptions;
   engineVersion: string;
   flow: string;
   pair: { base: RunId; head: RunId };
@@ -939,9 +1040,119 @@ export interface DiffResult {
   steps: StepDiff[];
   summary: DiffSummary;
   warnings: string[];
+  /**
+   * The channels this diff was computed with, when either was off (D54). Absent means both were
+   * on — the default, and what every diff stored before this field existed was computed under.
+   *
+   * Stored rather than derived, because an empty findings list has two causes that must not be
+   * confused: nothing was found, or nothing was looked for. A reader — the report, the comment,
+   * the cache rule in `cli/commands/pair.ts` — needs to be able to tell them apart.
+   */
+  emit?: DiffEmitChannels;
 }
 
-export interface DiffEngineOptions {
+/** Which of the diff's report channels were emitted (D54), and which kinds of finding (D57). */
+export interface DiffEmitChannels {
+  findings: boolean;
+  warnings: boolean;
+  /**
+   * The kinds this diff was allowed to emit. Absent means every kind — the default, and what a
+   * diff stored before the allowlist existed was computed under.
+   */
+  kinds?: FindingKind[];
+}
+
+/* ------------------------------------------------------------------ model-written review (CI spec D39) */
+
+/** The hosted model APIs `vdiff review` can call. Chosen by which API key the environment holds. */
+export const REVIEW_PROVIDERS = ['anthropic', 'openai'] as const;
+export type ReviewProvider = (typeof REVIEW_PROVIDERS)[number];
+
+/**
+ * What the reviewer made of one change. It has the findings, the screenshots and — when the caller
+ * supplied one — the pull request's own description of the change, so the vocabulary is about how
+ * a change reads *against that description*, never a claim to know what the author meant:
+ *
+ * - `expected`   — consistent with the described change, or an obviously deliberate edit
+ * - `unrelated`  — real, but nothing in the description accounts for it: the thing that should not
+ *                  have moved and did
+ * - `regression` — looks broken on its face: clipping, overflow, a vanished control, lost contrast
+ * - `unclear`    — the evidence does not say
+ */
+export const REVIEW_ASSESSMENTS = ['expected', 'unrelated', 'regression', 'unclear'] as const;
+export type ReviewAssessment = (typeof REVIEW_ASSESSMENTS)[number];
+
+export const TRIAGE_ASSESSMENTS = ['meaningful', 'capture-noise', 'uncertain', 'capture-incomplete'] as const;
+export interface ReviewNoiseAssessment {
+  assessment: (typeof TRIAGE_ASSESSMENTS)[number];
+  confidence: 'high' | 'low';
+  /** Short explanation grounded in the supplied evidence. */
+  reason: string;
+}
+export interface ReviewFindingAssessment extends ReviewNoiseAssessment {
+  findingId: string;
+}
+export interface ReviewViewportAssessment extends ReviewNoiseAssessment {
+  step: StepId;
+  viewport: ViewportId;
+}
+export interface ReviewTriage {
+  version: 1;
+  findings: ReviewFindingAssessment[];
+  viewports: ReviewViewportAssessment[];
+  /** Actual base/head screenshot pairs supplied to the model, recorded by the caller. */
+  comparedCells: Array<{ step: StepId; viewport: ViewportId }>;
+}
+
+export interface ReviewChange {
+  /** Step id the change belongs to, exactly as `DiffResult.steps[].id` spells it. */
+  step: StepId;
+  /** Viewport the change was seen at; null when it applies to every viewport of the step. */
+  viewport: ViewportId | null;
+  /** One sentence: what changed, in the reviewer's words. */
+  description: string;
+  assessment: ReviewAssessment;
+}
+
+/**
+ * `review.json` — a model's reading of one stored diff (CI spec D39).
+ *
+ * Stored beside `findings.json` and keyed to the same pair and engine version, so a review of a
+ * diff that has since been recomputed reads as absent rather than as stale. Everything a reader
+ * needs to weigh it is on the object: which model wrote it, what it was shown, and when.
+ */
+export interface Review {
+  /** Optional AI noise assessment. Never changes measured evidence or CI gate decisions. */
+  triage?: ReviewTriage;
+  /** Exact evidence and tolerance classification used to produce this review. */
+  diffFingerprint?: string;
+  flow: string;
+  pair: { base: RunId; head: RunId };
+  /** Engine version of the `findings.json` this review read. Mismatch means the review is stale. */
+  engineVersion: string;
+  provider: ReviewProvider;
+  model: string;
+  generatedAt: IsoDate;
+  /**
+   * The single most important change, in one sentence — what a reviewer with ten seconds should
+   * know. A regression or an unrelated change outranks the biggest intended one.
+   */
+  headline: string;
+  /** Two or three sentences that read the whole diff, after the headline. */
+  summary: string;
+  /** Every distinct change the model saw, most important first. */
+  changes: ReviewChange[];
+  /**
+   * What a human should look at before merging: each `unrelated` or `regression` change restated
+   * as a warning, plus anything the screenshots show that the findings do not. Empty when the model
+   * saw nothing to raise — and the comment then says so, because silence is not the same as "fine".
+   */
+  concerns: string[];
+  /** How much the model was shown: how many (step, viewport) cells and how many images. */
+  evidence: { cells: number; images: number; contextProvided: boolean };
+}
+
+export interface DiffEngineOptions extends VisualToleranceOptions {
   minRegionArea: number;
   maxRegions: number;
   antialiasTolerance: number;
@@ -951,6 +1162,15 @@ export interface DiffEngineOptions {
   deviceScaleFactor: number;
   /** Skip the cache and recompute. */
   force?: boolean;
+  /**
+   * Emit findings (D54). **Absent means yes**, so a caller that assembles these options by hand —
+   * and every one of them predates this field — keeps the behaviour it had.
+   */
+  emitFindings?: boolean;
+  /** Emit warnings (D54). Absent means yes, for the same reason. */
+  emitWarnings?: boolean;
+  /** The kinds to emit (D57). Absent means every kind, for the same reason. */
+  kinds?: readonly FindingKind[];
 }
 
 /* ------------------------------------------------------------------ store (§6) */
@@ -1179,7 +1399,19 @@ export interface RunOptions {
    */
   scenario?: ScenarioName;
   continueOnError?: boolean;
+  /** Overrides the flow's `baseUrl` for this run — the origin CI serves the app at, typically. */
   baseUrl?: string;
+  /**
+   * Overrides `app.readyOn` for this run. Paired with `baseUrl` when CI fronts the dev server with
+   * a proxy on a different origin than the one `.visual-diff/config.yaml` names for local work.
+   * Applies to a historical replay too, which is the point: the flow read from git keeps its
+   * local origin, and the override is what makes both sides of a CI diff reach the same server.
+   */
+  readyOn?: string;
+  /** Overrides `browser.ignoreHTTPSErrors` for this run. */
+  ignoreHTTPSErrors?: boolean;
+  /** Overrides `app.stepTimeoutMs` for this run — the per-action timeout inside a step. */
+  stepTimeoutMs?: number;
   /** Write an unscrubbed HAR. Requires an explicit flag (spec §6). */
   noScrub?: boolean;
   json?: boolean;
@@ -1287,7 +1519,7 @@ export interface Adapter {
 /* ------------------------------------------------------------------ defaults (§6, §12) */
 
 /** Bumped whenever diff output could change; part of the diff cache key (spec §8). */
-export const DIFF_ENGINE_VERSION = '1';
+export const DIFF_ENGINE_VERSION = '4';
 
 /**
  * Single source of truth for every default named in the spec. config/defaults.ts re-exports these
@@ -1296,6 +1528,8 @@ export const DIFF_ENGINE_VERSION = '1';
 export const DEFAULTS = {
   /** spec §7 */
   deviceScaleFactor: 2,
+  /** The mask paint (D55). Playwright's own default, and unmistakably not part of any UI. */
+  maskColor: '#ff00ff',
   /** spec §12 */
   maxDomNodes: 5000,
   /** spec §6 */
@@ -1305,9 +1539,18 @@ export const DEFAULTS = {
     minRegionArea: 64,
     maxRegions: 40,
     antialiasTolerance: 0.1,
+    maxChangedPixelRatio: 0.003,
+    layout: { enabled: true, tolerancePx: 2 },
     ignore: [] as string[],
+    /** Both channels are on: turning one off is a choice a project makes explicitly (D54). */
+    findings: true,
+    warnings: true,
+    /** Every kind (D57). Narrowing is the project's decision, never a default. */
+    kinds: [...FINDING_KINDS] as FindingKind[],
   },
   retention: { keepRuns: 20 },
+  /** Everything is collected (D58); not collecting is the project's decision. */
+  capture: { a11y: true, console: true, network: true },
   network: { redact: [] as string[], scrub: true },
   /** mocking spec §5 — a scenario file that omits `mode:` is an overlay. */
   scenarioMode: 'overlay' as ScenarioMode,

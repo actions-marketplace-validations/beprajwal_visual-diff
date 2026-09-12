@@ -10,27 +10,38 @@
  *
  *  1. **The document opens with the answer.** A reviewer who reads one line learns how many findings
  *     there are, how severe, how much moved, and whether the pairing is an ordinary
- *     revision-to-revision comparison. Everything else is elaboration.
+ *     revision-to-revision comparison. Unchanged comparisons need only a short verdict and link.
  *  2. **It never lies about its own size.** GitHub rejects a body over 65536 characters, so rows and
  *     images are capped — and every cap states the number it dropped and where the whole set lives.
  *     A silent truncation misreports the size of the change, which is the one thing this feature
  *     exists to prevent (D33).
  */
 
-import type { DiffResult, Finding } from '../types.js';
+import { FINDING_KINDS } from '../types.js';
+import type { DiffResult, Finding, Review } from '../types.js';
 import { evaluateGate, GATE_NONE, type GateLevel, type GateVerdict } from './gate.js';
 import {
-  allFindings,
   BUNDLE_FILES,
   selectCells,
   shotCells,
   type ShotCell,
 } from './layout.js';
+import { reviewLines } from './review-render.js';
+import { commentFingerprint, reviewProjection } from './review-triage.js';
+import { hasMinorChanges, significantDiff } from '../diff/significance.js';
 
 /** GitHub's hard limit is 65536 characters; the margin absorbs whatever a transport prepends. */
 export const MAX_COMMENT_BYTES = 65000;
-export const DEFAULT_MAX_FINDINGS = 25;
 export const DEFAULT_MAX_IMAGES = 4;
+
+/**
+ * The mark, served from this repository so a comment on any pull request anywhere can show it.
+ * Pinned to `main` rather than a tag: the file changes about never, and a comment rendered by a
+ * pre-release build must not carry a link to a tag that does not exist yet.
+ */
+export const LOGO_URL =
+  'https://raw.githubusercontent.com/beprajwal/visual-diff/main/assets/logo-128.png';
+export const PRODUCT_NAME = 'Visual Diff';
 
 export interface CommentInput {
   result: DiffResult;
@@ -49,6 +60,27 @@ export interface CommentInput {
   imageBase?: string;
   /** Link to the uploaded evidence bundle. Every truncation notice points at it. */
   artifactUrl?: string;
+  /**
+   * Link to a hosted rendering of the full report page — a published Claude artifact, a Pages
+   * deployment, anywhere `report.html` is readable as a page. Unlike `artifactUrl`, which is a
+   * footer credit to a zip, this is the comment's call to action, so it renders with the verdict.
+   */
+  reportUrl?: string;
+  /**
+   * The bundle's own captures of `report.html` (D51), as paths relative to `imageBase`. Rendered
+   * right under the verdict as one picture — the dark capture for a reader whose GitHub is dark —
+   * that links to `reportUrl` when there is one. Needs `imageBase` for the same reason the step
+   * images do: a picture nobody can fetch is a broken image, not a preview.
+   */
+  preview?: { light: string; dark?: string };
+  /** Evidence fingerprint stamped when the preview was actually captured. */
+  previewDiffFingerprint?: string;
+  /**
+   * A model's reading of the diff (D39), rendered right after the verdict: the headline, a warning
+   * when anything is outside the described change or looks broken, then the ranked changes. Absent
+   * renders the comment CI mode always rendered — numbers, tables, links.
+   */
+  review?: Review;
   /** Shown when there is no `artifactUrl` — an artifact a reader has to find by name is still a lead. */
   artifactName?: string;
   /** The gate this job was configured with. Omitted renders no gate line at all. */
@@ -57,7 +89,6 @@ export interface CommentInput {
   version: string;
   /** Overrides the marker that makes this comment updatable in place (D33). */
   marker?: string;
-  maxFindings?: number;
   maxImages?: number;
   maxBytes?: number;
   /** Commands that reproduce this exact pair locally. Rendered verbatim in the footer. */
@@ -66,13 +97,15 @@ export interface CommentInput {
 
 export interface CommentDocument {
   markdown: string;
+  /** A complete, quiet comparison with no changes above tolerance; safe for CI to summarize. */
+  unchanged: boolean;
   /** The HTML comment an upserting transport searches for. Always the first line of `markdown`. */
   marker: string;
   bytes: number;
   /** Image groups actually rendered. Zero whenever no `imageBase` was given. */
   images: number;
   /** What did not fit, so the caller can log it and the reader can be told (D33). */
-  truncated: { findings: number; images: number; steps: boolean };
+  truncated: { images: number; steps: boolean };
 }
 
 /**
@@ -87,7 +120,8 @@ export function markerFor(flow: string, kind = 'pr'): string {
 
 /* ------------------------------------------------------------------ small renderers */
 
-const percent = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`;
+const percent = (ratio: number): string =>
+  ratio > 0 && ratio < 0.001 ? '<0.1%' : `${(ratio * 100).toFixed(1)}%`;
 
 /** Table-cell safe: no newline can break the row, no pipe can invent a column. */
 function cell(value: string): string {
@@ -126,9 +160,9 @@ function table(headers: readonly string[], rows: readonly string[][]): string[] 
 }
 
 const SEVERITY_MARK: Record<Finding['severity'], string> = {
-  high: '🔴 high',
-  med: '🟠 med',
-  low: '⚪ low',
+  high: '🔴',
+  med: '🟠',
+  low: '⚪',
 };
 
 function joinUrl(base: string, relative: string): string {
@@ -137,13 +171,21 @@ function joinUrl(base: string, relative: string): string {
 
 /* ------------------------------------------------------------------ sections */
 
-function verdictLines(input: CommentInput): string[] {
+function verdictLines(input: CommentInput, minorOnly = false): string[] {
   const { result } = input;
   const summary = result.summary;
   const pair = `${result.pair.base}..${result.pair.head}`;
   const lines: string[] = [];
 
-  lines.push(`### visual-diff — \`${result.flow}\` \`${pair}\``);
+  // The mark and the name, so a reader scanning a pull request with four bots on it knows whose
+  // comment this is before reading a number. Inline HTML is the only way to put an image in a
+  // GitHub heading; the alt text is empty because the name follows it. The comment's author is
+  // whatever identity the token carries (github-actions, or a Visual Diff GitHub App when the
+  // action is given one — D49), so the heading is the one place the product is always named, and
+  // it is sized like a title: a 32px mark on an h2, with the flow and the pair on their own line.
+  lines.push(`## <img src="${LOGO_URL}" width="32" alt="" align="absmiddle"> ${PRODUCT_NAME}`);
+  lines.push('');
+  lines.push(`\`${result.flow}\` · \`${pair}\``);
   lines.push('');
 
   const headline =
@@ -158,7 +200,32 @@ function verdictLines(input: CommentInput): string[] {
     (summary.stepsSpecChanged > 0 ? `, ${summary.stepsSpecChanged} spec-changed` : '') +
     (summary.stepsFailed > 0 ? `, ${summary.stepsFailed} failed` : '') +
     (summary.stepsBlocked > 0 ? `, ${summary.stepsBlocked} blocked` : '');
-  lines.push(`${headline} · max pixel change ${percent(summary.maxPixelChangedRatio)} · ${steps}`);
+  lines.push(minorOnly ? '**No changes above the configured thresholds.**' :
+    `${headline} · max pixel change ${percent(summary.maxPixelChangedRatio)} · ${steps}`);
+
+  // "No findings" has two causes, and on a pull request the wrong one reads as a clean bill of
+  // health: this diff was computed with the findings channel off (D54), so it never looked.
+  if (result.emit !== undefined && !result.emit.findings) {
+    lines.push('');
+    lines.push(
+      '> **Findings are off for this diff** (`diff.findings: false`), so this comment reports ' +
+        'pixel change and nothing else.',
+    );
+  }
+
+  // Same reasoning one notch finer (D57): this diff reported only some kinds, and a reader counting
+  // the ones that are missing would count them as clean.
+  const omittedKinds =
+    result.emit?.kinds === undefined
+      ? []
+      : FINDING_KINDS.filter((kind) => !result.emit?.kinds?.includes(kind));
+  if (omittedKinds.length > 0) {
+    lines.push('');
+    lines.push(
+      `> **Not looked for in this diff** (\`diff.kinds\`): ${omittedKinds.join(', ')}. Their ` +
+        'absence below is not a clean bill of health.',
+    );
+  }
 
   // A failed or blocked step is not a finding, and a summary that only counted findings would let a
   // run that never reached checkout read as "no findings" — the most misleading green in the tool.
@@ -187,43 +254,48 @@ function verdictLines(input: CommentInput): string[] {
     lines.push(gate.tripped ? `❌ **Gate failed** — ${gate.reason}` : `✅ Gate passed — ${gate.reason}`);
   }
 
-  return lines;
-}
-
-function findingRow(finding: Finding): string[] {
-  const where = `${finding.step}${finding.viewport === undefined ? '' : ` @${finding.viewport}`}`;
-  const change =
-    finding.changes.length === 0
-      ? cell(finding.label)
-      : `${cell(finding.label)}: ${finding.changes
-          .slice(0, 3)
-          .map((c) => `${cell(c.prop)} ${code(String(c.from ?? '—'))} → ${code(String(c.to ?? '—'))}`)
-          .join('; ')}`;
-  return [
-    code(finding.id),
-    SEVERITY_MARK[finding.severity],
-    cell(finding.kind),
-    code(where),
-    code(finding.element?.selector ?? '—'),
-    change,
-  ];
-}
-
-function findingsSection(
-  findings: readonly Finding[],
-  shown: number,
-  artifactHint: string,
-): string[] {
-  if (findings.length === 0) return [];
-  const visible = findings.slice(0, Math.max(0, shown));
-  const lines = ['', '#### Findings', ''];
-  lines.push(...table(['ID', 'SEV', 'KIND', 'WHERE', 'ELEMENT', 'CHANGE'], visible.map(findingRow)));
-  const dropped = findings.length - visible.length;
-  if (dropped > 0) {
+  // The picture of the report (D51): what the reader lands on when they click, shown before the
+  // words about it. `<picture>` lets GitHub pick the capture that matches the reader's theme; the
+  // `<img>` inside is the light one, which is also what every renderer without `<picture>` shows.
+  if (input.preview !== undefined && input.imageBase !== undefined) {
+    const light = joinUrl(input.imageBase, input.preview.light);
+    const picture = [
+      '<picture>',
+      ...(input.preview.dark === undefined
+        ? []
+        : [
+            `<source media="(prefers-color-scheme: dark)" srcset="${joinUrl(input.imageBase, input.preview.dark)}">`,
+          ]),
+      `<img src="${light}" alt="The visual-diff report for ${result.flow} ${pair}" width="100%">`,
+      '</picture>',
+    ].join('');
     lines.push('');
-    lines.push(`… ${dropped} more finding${dropped === 1 ? '' : 's'} — ${artifactHint}`);
+    lines.push(
+      input.reportUrl === undefined ? picture : `<a href="${input.reportUrl}">${picture}</a>`,
+    );
   }
+
+  if (input.reportUrl !== undefined) {
+    lines.push('');
+    lines.push(`📊 **[Open the full report](${input.reportUrl})** — every shot, side by side`);
+  }
+
   return lines;
+}
+
+/**
+ * "2 findings (1 high ●, 1 low ○)" — the group's finding load compressed to a phrase. The comment
+ * carries no findings table (the full rows live in `findings.json` and the report page), so this
+ * phrase and the steps table are where the numbers surface.
+ */
+function findingPhrase(findings: readonly Finding[]): string {
+  if (findings.length === 0) return 'no findings';
+  const counts = { high: 0, med: 0, low: 0 };
+  for (const finding of findings) counts[finding.severity] += 1;
+  const parts = (['high', 'med', 'low'] as const)
+    .filter((severity) => counts[severity] > 0)
+    .map((severity) => `${counts[severity]} ${severity} ${SEVERITY_MARK[severity]}`);
+  return `${findings.length} finding${findings.length === 1 ? '' : 's'} (${parts.join(', ')})`;
 }
 
 function stepsSection(result: DiffResult, cells: readonly ShotCell[]): string[] {
@@ -252,7 +324,7 @@ function imageGroup(cellData: ShotCell, imageBase: string): string[] {
   const heading =
     `<code>${cellData.step}</code> @ ${cellData.viewport} — ` +
     (cellData.missing === undefined
-      ? `${percent(cellData.pixelChangedRatio)} pixels, ${cellData.findings.length} finding(s)`
+      ? `<strong>${percent(cellData.pixelChangedRatio)} of pixels changed</strong> · ${findingPhrase(cellData.findings)}`
       : `capture missing on the ${cellData.missing} side`);
 
   // The base/head pair is shown even when the pixel diff is absent (an added step has no base to
@@ -294,7 +366,7 @@ function imagesSection(
     return { lines: [], rendered: 0, dropped: 0 };
   }
   const visible = cells.slice(0, Math.max(0, shown));
-  const lines = ['', '#### Screenshots', ''];
+  const lines = ['', '#### What changed', ''];
   for (const cellData of visible) lines.push(...imageGroup(cellData, imageBase));
   const dropped = cells.length - visible.length;
   if (dropped > 0) {
@@ -344,21 +416,75 @@ function artifactHintFor(input: CommentInput): string {
  *
  * Sections are assembled in priority order and shrunk from the bottom when the body will not fit:
  * the step table goes first, then screenshots, then finding rows. The verdict, the notices, the gate
- * line and the footer are never dropped — a comment that fits by removing the answer is not a
- * smaller comment, it is a different one.
+ * line and the footer stay on detailed reports. Complete, unchanged comparisons return a single
+ * text line instead of the report layout.
  */
 export function renderComment(input: CommentInput): CommentDocument {
+  const raw = input.result;
+  const measured = significantDiff(raw);
+  const minor = hasMinorChanges(raw);
+  const projection = reviewProjection(raw, input.review);
+  const fingerprint = commentFingerprint(raw, input.review);
+  input = { ...input, result: projection.result, review: projection.review,
+    ...(input.previewDiffFingerprint !== fingerprint ? { preview: undefined } : {}) };
+  if (input.gate !== undefined) input = { ...input, gate: evaluateGate(measured.summary, input.gate.level) };
+  const minorOnly = minor && input.result.summary.totalFindings === 0 && input.result.summary.stepsChanged === 0 &&
+    input.result.steps.every(step => step.status === 'matched');
   const marker = input.marker ?? markerFor(input.result.flow);
+  const summary = measured.summary;
+  // Use measured evidence, not AI triage: capture noise classified by a model is still a review.
+  const unchanged =
+    summary.stepsCompared > 0 &&
+    summary.totalFindings === 0 && summary.stepsChanged === 0 && summary.maxPixelChangedRatio === 0 &&
+    summary.stepsAdded === 0 && summary.stepsRemoved === 0 && summary.stepsSpecChanged === 0 &&
+    summary.stepsFailed === 0 && summary.stepsBlocked === 0 &&
+    measured.steps.every(step =>
+      step.status === 'matched' && step.findings.length === 0 &&
+      Object.values(step.viewports).every(vp =>
+        vp.missing === undefined && !vp.dimensionsChanged &&
+        vp.pixelChangedRatio === 0 && vp.findings.length === 0,
+      ),
+    ) &&
+    raw.warnings.length === 0 && (input.notices?.length ?? 0) === 0 &&
+    projection.captureConcerns.length === 0;
+  if (unchanged) {
+    const verdict = minor ? 'No visual changes above configured thresholds' : 'No visual changes';
+    const url = input.reportUrl ?? input.artifactUrl;
+    const link = url === undefined ? '' : ` [Report](${url})`;
+    const markdown = `${marker}\n**${PRODUCT_NAME}:** ${verdict} in ${code(raw.flow)}.${link}\n`;
+    return {
+      markdown, marker, unchanged,
+      bytes: Buffer.byteLength(markdown, 'utf8'),
+      images: 0,
+      truncated: { images: 0, steps: false },
+    };
+  }
   const maxBytes = input.maxBytes ?? MAX_COMMENT_BYTES;
   const hint = artifactHintFor(input);
 
-  const head = [marker, ...verdictLines(input)];
+  const head = [marker, ...verdictLines(input, minorOnly)];
+  const aiFiltered = projection.omittedFindings > 0 || projection.omittedViewports > 0;
+  if (aiFiltered) {
+    const onlyNoise = input.result.summary.totalFindings === 0 && input.result.summary.stepsChanged === 0 &&
+      input.result.steps.every(step => step.status === 'matched');
+    if (onlyNoise) {
+      // This is an AI judgement, not evidence that the screenshots were identical.
+      const index = head.findIndex(line => line.startsWith('**No findings.') || line.startsWith('**No changes above'));
+      if (index !== -1) head[index] = '**AI classified the reviewed visual changes as capture noise.**';
+    }
+    head.push('', '_AI omitted likely capture noise from this comment; the full report retains all evidence. The gate still uses measured findings._');
+  }
+  for (const concern of projection.captureConcerns) {
+    head.push('', `> **Capture readiness:** ${code(concern.step)} @ ${cell(concern.viewport)} — ${cell(concern.reason)}`);
+  }
+  // The review sits between the verdict and the pictures (D39): it is the sentence the numbers
+  // could not write, so it reads before the evidence it is about. Never shrunk away — its own
+  // renderer caps the lists — for the same reason the verdict is not.
+  const review = input.review === undefined ? [] : ['', ...reviewLines(input.review)];
   const foot = footerLines(input);
-  const findings = allFindings(input.result);
   const everyCell = shotCells(input.result);
   const cells = selectCells(everyCell, 'changed');
 
-  let findingBudget = Math.min(findings.length, input.maxFindings ?? DEFAULT_MAX_FINDINGS);
   let imageBudget = Math.min(cells.length, input.maxImages ?? DEFAULT_MAX_IMAGES);
   let withSteps = true;
 
@@ -366,7 +492,7 @@ export function renderComment(input: CommentInput): CommentDocument {
     const images = imagesSection(cells, imageBudget, input.imageBase, hint);
     const lines = [
       ...head,
-      ...findingsSection(findings, findingBudget, hint),
+      ...review,
       ...images.lines,
       ...(withSteps ? stepsSection(input.result, everyCell) : []),
       ...foot,
@@ -377,8 +503,9 @@ export function renderComment(input: CommentInput): CommentDocument {
   let built = assemble();
   const size = (): number => Buffer.byteLength(`${built.lines.join('\n')}\n`, 'utf8');
 
-  // Shrink in the order above. Each loop re-measures rather than estimating, because a single
-  // finding row carrying a long selector is worth more than a screenshot group.
+  // Shrink in the order above, re-measuring each time. The steps table goes before the images
+  // because the images are the comment's answer — the table's numbers survive in the verdict line
+  // and the group headings.
   if (size() > maxBytes && withSteps) {
     withSteps = false;
     built = assemble();
@@ -387,19 +514,15 @@ export function renderComment(input: CommentInput): CommentDocument {
     imageBudget -= 1;
     built = assemble();
   }
-  while (size() > maxBytes && findingBudget > 1) {
-    findingBudget = Math.max(1, Math.floor(findingBudget / 2));
-    built = assemble();
-  }
 
   const markdown = `${built.lines.join('\n')}\n`;
   return {
     markdown,
+    unchanged,
     marker,
     bytes: Buffer.byteLength(markdown, 'utf8'),
     images: built.images,
     truncated: {
-      findings: Math.max(0, findings.length - findingBudget),
       images: Math.max(0, cells.length - imageBudget),
       steps: !withSteps,
     },
@@ -411,6 +534,6 @@ export function renderCommentWithGate(
   input: Omit<CommentInput, 'gate'>,
   level: GateLevel,
 ): { document: CommentDocument; gate: GateVerdict } {
-  const gate = evaluateGate(input.result.summary, level);
+  const gate = evaluateGate(significantDiff(input.result).summary, level);
   return { document: renderComment({ ...input, gate }), gate };
 }

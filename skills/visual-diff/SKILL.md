@@ -1,3 +1,8 @@
+---
+name: visual-diff
+description: "Verify UI you just built by replaying it: capture the workflow, diff it against a previous iteration, summarize what changed, and hand over a live report. Use after changing any user-visible component, layout, style, route, or copy, and before claiming a UI change works."
+---
+
 # Visual Diff
 
 Verify UI you just built by replaying it, not by reading it. `vdiff` replays a recorded workflow
@@ -8,6 +13,14 @@ piece of copy. Use it before claiming a UI change works.
 
 Every command accepts `--json`. Pass it whenever you intend to read the result — parse the envelope,
 never scrape the human table.
+
+## If `vdiff` is not installed
+
+This skill may have arrived ahead of the CLI (a skill installer, a cloned repo). Check with
+`vdiff --version`; when it is missing, run every command as `npx @beprajwal/visual-diff <command>`,
+or install it once — `npm install -g @beprajwal/visual-diff` (or `--save-dev` to pin it per
+project). First-time setup in a repo with no `.visual-diff/` yet: `vdiff init`, then
+`vdiff install-browser` (the one-time Chromium download). Ask before installing anything global.
 
 ## The loop
 
@@ -63,10 +76,25 @@ screenshots alone.
 **`vdiff diff` exits 0 even when findings exist.** Findings are information, not a gate. A non-empty
 result is the normal case after a UI change — it does not mean something is broken.
 
+A step whose two screenshots are identical reports no findings at all, and `steps changed` counts
+pixel movement, so an unchanged frame never arrives with a finding attached to it. A step-scoped
+finding — a new console error, a new request — is still reported on such a step; it is a fact about
+the run, not about the pixels.
+
+Read the `emit` block in `findings.json` before you read the absence of a finding kind. A project
+can narrow which kinds are emitted (`diff.kinds`), turn a channel off entirely (`diff.findings` /
+`diff.warnings`, or `--no-findings` / `--no-warnings`), or stop collecting console and network
+output at capture (`capture:`). `emit.kinds` lists what this diff was allowed to report; a kind
+missing from it was never looked for, which is not the same as clean — say so in your summary
+rather than reporting a quiet console you never saw.
+
 ## Step 4 — summarize
 
-This is your job, not the tool's. `vdiff` deliberately ships no model and no API key: it emits
-structured findings, and you turn them into a sentence, because you know *why* the change was made.
+This is your job, not the tool's. In an agent session `vdiff` calls no model: it emits structured
+findings, and you turn them into a sentence, because you know *why* the change was made. (`vdiff
+review` exists for the seat you are not in — CI, where an API key lets a model write this paragraph
+from the findings, the screenshots and the pull request description. Do not run it to do your own
+job; you have the intent it has to guess at.)
 
 Good: "The Pay button label changed to 'Pay now' and grew 26px, and a trust badge now sits below it —
 both intended. Step 3 also shifted the heading colour, which I did not intend."

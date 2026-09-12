@@ -17,12 +17,13 @@ export const EXAMPLE_FLOW_NAME = 'example';
  * nothing to read — and the failure is a confusing "variant absent at the target SHA" on a file
  * that is plainly sitting on disk. Everything else — runs, diffs, cache, feedback — is local.
  */
-export const GITIGNORE_BLOCK = `# visual-diff — flows, scenarios, variants and config are committed; runs, diffs, cache and feedback are local.
+export const GITIGNORE_BLOCK = `# visual-diff — flows, scenarios, variants, fixtures and config are committed; runs, diffs, cache and feedback are local.
 .visual-diff/*
 !.visual-diff/config.yaml
 !.visual-diff/flows/
 !.visual-diff/scenarios/
 !.visual-diff/variants/
+!.visual-diff/fixtures/
 `;
 
 /** Presence of this line means the block has already been installed. */
@@ -52,6 +53,11 @@ diff:
   minRegionArea: 64        # ignore changed regions smaller than this many pixels
   maxRegions: 40           # cap boxes per shot; the remainder collapses to "N smaller changes"
   antialiasTolerance: 0.1
+  # Keep minor changes in the HTML report, omit them from PR comments and gates.
+  maxChangedPixelRatio: 0.003  # fraction: 0.003 = 0.3%, inclusive; 0 disables pixel allowance
+  layout:
+    enabled: true             # false tolerates all geometry changes
+    tolerancePx: 2            # CSS pixels, inclusive; 0 flags any movement or resize
   ignore: ["[data-test=session-id]"]   # selectors excluded from regions and findings
 
 network:

@@ -423,11 +423,15 @@ async function bindServer(
 ): Promise<ServerBinding> {
   const config = store.config;
   const configuredBase = options.baseUrl ?? spec.baseUrl ?? config.baseUrl;
+  // The run's override wins over the file (CI spec D41): a runner fronting the dev server on
+  // another origin says so once, for both sides of the diff, without touching a committed file.
+  const readyOn = options.readyOn ?? config.app.readyOn;
+  const insecureTls = options.ignoreHTTPSErrors ?? config.browser?.ignoreHTTPSErrors ?? false;
 
   if (target.mode === 'attach' && configuredBase !== undefined) {
     const port = portOfUrl(configuredBase);
-    const readyUrl = port === null ? config.app.readyOn : substitutePort(config.app.readyOn, port);
-    if (await probe(readyUrl)) {
+    const readyUrl = port === null ? readyOn : substitutePort(readyOn, port);
+    if (await probe(readyUrl, undefined, insecureTls)) {
       return { mode: 'attach', baseUrl: configuredBase };
     }
   }
@@ -435,12 +439,13 @@ async function bindServer(
   const handle = await startDevServer({
     command: config.app.dev,
     cwd: target.projectDir,
-    readyOn: config.app.readyOn,
+    readyOn,
     readyTimeoutMs: config.app.readyTimeoutMs,
+    insecureTls,
   });
   return {
     mode: 'spawn',
-    baseUrl: spawnedBaseUrl(configuredBase, handle.port, config.app.readyOn),
+    baseUrl: spawnedBaseUrl(configuredBase, handle.port, readyOn),
     handle,
   };
 }
@@ -589,6 +594,10 @@ export async function runFlow(
     const viewports: Viewport[] = normalizeViewports(
       options.viewports ?? (spec.viewports.length > 0 ? spec.viewports : DEFAULTS.viewports),
     );
+
+    // What this run collects (D58). Read defensively: a `Config` built before the block existed
+    // carries none, and everything is collected by default.
+    const capture = { ...DEFAULTS.capture, ...(store.config.capture ?? {}) };
 
     // The scenario is resolved before the network is planned, because it is the scenario that says
     // whether this run needs a recording at all (D13). On the slow path it is read out of git
@@ -791,6 +800,28 @@ export async function runFlow(
           ...(scenarioInForce ? { newScenarioRuntime } : {}),
           ...(options.continueOnError === undefined ? {} : { continueOnError: options.continueOnError }),
           ...(storageState === undefined ? {} : { storageState }),
+          ...((options.ignoreHTTPSErrors ?? store.config.browser?.ignoreHTTPSErrors) === true
+            ? { ignoreHTTPSErrors: true }
+            : {}),
+          // Read from the working tree's config on both sides of a diff, like the session file is:
+          // a historical replay takes its flow from git and its capture settings from the machine,
+          // so changing the paint repaints both sides at once rather than one of them (D55).
+          ...(store.config.browser?.maskColor === undefined
+            ? {}
+            : { maskColor: store.config.browser.maskColor }),
+          ...(store.config.browser?.mask === undefined
+            ? {}
+            : { paintMasks: store.config.browser.mask }),
+          // The one capture switch the replayer itself has to know about: the other two are files
+          // this function decides whether to write (D58).
+          captureA11y: capture.a11y,
+          // `upload` paths resolve inside the working tree's `.visual-diff/`, like the session file:
+          // a historical replay reads its flow from git and its fixtures from the machine.
+          fixturesDir: paths.vdiffDir(root),
+          // The per-action timeout: the run's override, then the file, then the replayer's default.
+          ...((options.stepTimeoutMs ?? store.config.app.stepTimeoutMs) === undefined
+            ? {}
+            : { timeoutMs: options.stepTimeoutMs ?? store.config.app.stepTimeoutMs }),
           deviceScaleFactor: DEFAULTS.deviceScaleFactor,
         });
       });
@@ -934,8 +965,10 @@ export async function runFlow(
         );
       }
 
-      await draft.writeStepConsole(step.id, consoleByStep.get(step.id) ?? []);
-      await draft.writeStepNetwork(step.id, networkByStep.get(step.id) ?? []);
+      // Collected either way — the hit/miss accounting and the miss warning are computed from the
+      // same traffic — and written only when the project wants them (D58).
+      if (capture.console) await draft.writeStepConsole(step.id, consoleByStep.get(step.id) ?? []);
+      if (capture.network) await draft.writeStepNetwork(step.id, networkByStep.get(step.id) ?? []);
       await draft.writeStepResult(merged);
       steps.push(merged);
     }
@@ -1083,6 +1116,17 @@ export async function runFlow(
       status: statusOf(steps),
       failedSteps,
       ...(storageState === undefined ? {} : { authenticated: true }),
+      // Stamped only when something was off, so a run of a project that never touches the switches
+      // writes the meta.json it always wrote (D58).
+      ...(capture.a11y && capture.console && capture.network
+        ? {}
+        : {
+            captured: {
+              ...(capture.a11y ? {} : { a11y: false }),
+              ...(capture.console ? {} : { console: false }),
+              ...(capture.network ? {} : { network: false }),
+            },
+          }),
       env,
       startedAt,
       finishedAt: isoNow(),

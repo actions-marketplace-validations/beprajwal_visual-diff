@@ -79,6 +79,19 @@ npm install --save-dev @beprajwal/visual-diff
 npx vdiff install claude-code
 ```
 
+### Or start from the skills
+
+The agent skills also install straight off this repo with the open skills CLI, for any harness it
+supports:
+
+```sh
+npx skills add beprajwal/visual-diff
+```
+
+That path ships the skills alone; the `visual-diff` skill tells the agent to reach the CLI through
+`npx @beprajwal/visual-diff` until it is installed. `vdiff install <harness>` remains the fuller
+install — it composes per-harness frontmatter and the `/vdiff` slash commands.
+
 ## The four core commands
 
 ```sh
@@ -94,7 +107,9 @@ opt-in gate tripped. `vdiff diff` exits `0` even when findings exist — finding
 gate — and `3` is reachable only from `vdiff comment --fail-on`, which nothing sets by default.
 
 Supporting commands: `vdiff install <target>`, `vdiff init`, `vdiff flow new|check <name>`,
-`vdiff runs <flow>`, `vdiff pin|prune <run>`, `vdiff install-browser`.
+`vdiff runs <flow>`, `vdiff pin|prune <run>`, `vdiff install-browser`, and — with an Anthropic or
+OpenAI API key in the environment — `vdiff review <flow>`, which has a model write the review the
+agent would have (see [A model reads the diff](#a-model-reads-the-diff)).
 
 ## On a pull request
 
@@ -103,23 +118,151 @@ npx @beprajwal/visual-diff install github-actions   # writes .github/workflows/v
 ```
 
 That is the whole setup. The pull-request workflow replays each flow at the merge-base and at the
-head, diffs them, uploads the evidence, and leaves one comment per flow that it updates in place on
-every push. The check stays **green**: findings are reported, not enforced, until you set
+head, diffs them, and uploads the evidence. Flows with no changes above the configured thresholds
+share one compact text comment with report links and no screenshots. Changed or incomplete flows
+keep their own reports; comments update in place on every push. The check stays **green**:
+findings are reported, not enforced, until you set
 `fail-on: high` or `fail-on: any` in the workflow.
 
-The pipeline itself lives in a composite action (`beprajwal/visual-diff@v<version>`) rather than in
-the file you just installed, so a fix reaches you on the next version bump. The installed workflows
-are yours — edit them, and a re-install preserves your edits and says so.
+The pipeline itself lives in a composite action. Use `beprajwal/visual-diff@v0` to receive stable
+minor and patch releases automatically; use a full tag such as `@v0.19.2` to pin a release.
+The installed workflows pin the CLI's current version. They are yours — edit them, and a
+re-install preserves your edits and says so. Leave the action's `version` input unset to use
+the CLI release associated with its tag.
 
 ```yaml
-- uses: beprajwal/visual-diff@v0.5.2
+- uses: beprajwal/visual-diff@v0
   with:
     flows: checkout search       # default: every flow in .visual-diff/flows
     fail-on: none                # none | high | any
     baseline: auto               # auto | cache | replay
     publish-branch: ''           # set it to embed screenshots in the comment
+    pages-url: ''                # Pages URL serving that branch: the comment links report.html as a page
+    anthropic-api-key: ''        # or openai-api-key — a model writes the review the comment opens with
+    app-id: ''                   # with app-private-key: the comment is posted as your "Visual Diff" GitHub App
     cli: ''                      # e.g. `npx vdiff` to use the version pinned in package.json
 ```
+
+### The comment, signed
+
+The comment's author is whoever holds the token: github-actions by default. To have it come from
+**Visual Diff** with its mark, create a GitHub App of that name in your organisation (Settings →
+Developer settings → GitHub Apps), upload `assets/logo-128.png` as its logo, grant it *Pull
+requests: read and write* and nothing else, install it on the repository, generate a private key,
+and hand both to the action:
+
+```yaml
+    app-id: ${{ vars.VISUAL_DIFF_APP_ID }}
+    app-private-key: ${{ secrets.VISUAL_DIFF_APP_PRIVATE_KEY }}
+```
+
+The action mints a token scoped to the repository for the comment and publish steps and touches
+nothing else with it.
+
+### A model reads the diff
+
+Locally, an agent turns the findings into a sentence, because it knows why the change was made. In
+CI nobody does, so the comment carried numbers. Give the action one API key and it also carries a
+**review**: the single most important change as a headline, every change ranked and marked
+`expected` / `unrelated` / `regression` / `unclear`, and a warning block for anything the pull
+request's own description does not account for. The pull request title and body are what the model
+judges against, so a PR that says "rename the Pay button" and also moves the heading colour gets told
+so.
+
+```yaml
+- uses: beprajwal/visual-diff@v0
+  with:
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}   # or openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+    # review-model: claude-opus-5                          # default per provider; gpt-6-astra for OpenAI
+```
+
+The provider is whichever key is present (Anthropic when both are). The key reaches exactly one step
+and only `vdiff review` reads it; a failed review is a warning, and the comment falls back to the
+numbers. The review is stored as `review.json` beside `findings.json`, travels in the bundle, shows
+in `report.html`, and always says which model wrote it and what it was shown. It never gates —
+`fail-on` still counts findings, not opinions.
+
+**No key at all** is also an option for Anthropic. Register GitHub Actions as an issuer in the
+Claude Console (Settings → Workload identity → Connect workload), grant the workflow
+`id-token: write`, and name the rule; the job exchanges its own OIDC identity for a token that lives
+minutes, and nothing is stored or rotated:
+
+```yaml
+permissions:
+  id-token: write
+  # …
+- uses: beprajwal/visual-diff@v0
+  with:
+    anthropic-federation-rule-id: fdrl_…
+    anthropic-organization-id: 00000000-0000-0000-0000-000000000000
+    anthropic-service-account-id: svac_…
+```
+
+Outside the action, `vdiff review` reads the same credentials the Anthropic SDK does, in the same
+order: `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN`, then the federation variables
+(`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`,
+`ANTHROPIC_IDENTITY_TOKEN_FILE`). A GitHub identity token can be exchanged once, so a job that
+reviews several flows should mint the bearer once and export it as `ANTHROPIC_AUTH_TOKEN`; the
+action does exactly that. The same command works anywhere:
+
+```sh
+ANTHROPIC_API_KEY=… vdiff review checkout --context pr.md   # or OPENAI_API_KEY; --provider forces one
+vdiff comment checkout                                       # picks the stored review up automatically
+```
+
+### The report as a site
+
+`publish-branch` already pushes each pull request's `report.html` and images to a branch. Point
+GitHub Pages at that branch (Settings → Pages → Deploy from a branch) and grant the workflow
+`pages: read`; the action asks the Pages API where the site is served, and the comment's **Open the
+full report** opens the interactive page for that pull request:
+
+```yaml
+permissions:
+  pages: read        # to find the site; contents: write is what publish-branch needs
+…
+    publish-branch: visual-diff-reports
+```
+
+`pages-url` overrides the lookup — a custom domain, or a site the token may not read.
+
+Who can open it is the repository's Pages visibility — private to the organisation on GitHub
+Enterprise Cloud, public otherwise. Pages deploys a pushed branch in about a minute, so the link can
+404 briefly after the first push of a new pull request. The screenshots in the
+comment are addressed through `github.com/<owner>/<repo>/raw/<branch>/…`, the one form GitHub
+renders for a private repository (it signs the file for the signed-in reader; every other host goes
+through the anonymous camo proxy and is turned away).
+
+With a publish target the comment also opens with one picture of the changes — a numbered list,
+additions and removals first, each with its base and head capture side by side — photographed light
+and dark, shown in the reader's GitHub theme, linking to the hosted report. Locally, `vdiff export
+--preview` writes the card (`preview.html`) and the two captures into the bundle.
+
+### When CI serves the app on another origin
+
+`config.yaml` names the origin your developers use. A runner often cannot: it fronts the dev server
+with a TLS proxy so the app is same-site with a real auth domain and the session cookies apply. Tell
+the run where the app is instead of editing a committed file — the override reaches the base side
+too, whose flow is read from git:
+
+```sh
+vdiff run checkout --base-url https://ci.example.test/core --ready-on https://ci.example.test/core/403 --ignore-https-errors
+```
+
+The action calls `vdiff run` without flags, so the same three are read from the environment:
+`VDIFF_BASE_URL`, `VDIFF_READY_ON`, `VDIFF_IGNORE_HTTPS_ERRORS=1`. Set them as job `env:` and every
+run in the job, base and head, uses them. `browser.ignoreHTTPSErrors: true` in `config.yaml` is the
+permanent form of the last one. Flag beats environment beats file.
+
+A cold dev server is the other thing a runner has that a laptop does not: `next dev` compiles a
+route on its first hit, often past the replayer's 15-second per-action default. Give steps longer
+with `app.stepTimeout: 60s` in `config.yaml`, `vdiff run --step-timeout 60s`, or
+`VDIFF_STEP_TIMEOUT=90s` in the job — same order, same unit-required syntax as `readyTimeout`.
+
+Recordings travel with the baseline: the cache the action keeps for a captured default branch holds
+each flow's HAR beside the runs, so a pull request that restores it replays the same traffic on both
+sides rather than recording twice against a backend that may have moved in between. A miss records
+and still works.
 
 Two commands do the rendering, and both work on their own, in any CI system or none:
 
@@ -127,6 +270,11 @@ Two commands do the rendering, and both work on their own, in any CI system or n
 vdiff comment <flow> [base] [head]   # the diff as markdown: stdout, or --out <file>
 vdiff export  <flow> [base] [head]   # a bundle: findings.json, comment.md, report.html, images/
 ```
+
+`export --html inline` makes `report.html` self-contained — every image embedded as a `data:` URI,
+so the one file is the whole report and can be mailed, attached, or served from anywhere that takes
+a single object. `--html both` keeps the linked page and writes `report.inline.html` beside it. The
+action forwards this as its `html:` input.
 
 Neither posts, pushes or uploads anything, and neither takes a token — the CLI renders, the action
 transports. Two consequences worth knowing before you read a comment and wonder:
@@ -141,8 +289,9 @@ transports. Two consequences worth knowing before you read a comment and wonder:
 
 The design is in
 [`docs/superpowers/specs/2026-08-11-ci-mode-design.md`](docs/superpowers/specs/2026-08-11-ci-mode-design.md),
-including what CI mode deliberately still does not do: there is no hosted report and no
-baseline-approval workflow.
+including what CI mode deliberately still does not do: no hosting of our own (the report is a page
+only where *you* serve it — Pages, a branch, an artifact) and no baseline-approval workflow. The
+review and the Pages link are decisions D39 and D40 in the same document.
 
 ## A flow spec
 
@@ -162,8 +311,125 @@ steps:
     waitFor: "text=Payment"
 ```
 
+A `mask` paints a solid rectangle over its selectors before the shot is taken, so a clock or an
+order id cannot make every run differ. Two settings in `config.yaml` decide how that looks:
+
+```yaml
+browser:
+  maskColor: '#ffffff'   # the paint; magenta by default, your page background hides it
+  # mask: false          # or paint nothing at all, and keep the shots as the page renders
+```
+
+Magenta is the default because a redaction bar should not be mistakable for the UI. `mask: false`
+turns the painting off entirely — the masked selectors still keep their content out of the pixel
+count, the regions and the findings, which is the job that actually matters, so the screenshots read
+as pictures of the product and a ticking clock still says nothing. (The two cannot be combined:
+there is no colour for a mask that paints nothing.)
+
+Either way, change it and recapture the baseline, or every masked rectangle reads as a change once.
+
+A flow can also `upload` committed fixture files (`upload: { "input[type=file]": fixtures/spec.pdf }`,
+paths relative to `.visual-diff/`; the selector may be the input or the button that opens the file
+dialog), which is how a flow creates the state it captures instead of pointing at data that has to
+exist on every machine.
+
 Step `id`s are stable and load-bearing: diffs align runs by `id`, never by index. `.visual-diff/flows/`
 and `.visual-diff/config.yaml` must be committed; runs, diffs, cache and feedback are ignored.
+
+### Turning the noise down
+
+Pixel and layout tolerances keep minor differences in the HTML report while leaving them out of
+the PR comment, its counts and previews, the AI review, and `--fail-on` gates. These controls are
+enabled by default, with these settings:
+
+```yaml
+diff:
+  maxChangedPixelRatio: 0.003 # allow up to and including 0.3% unexplained changed pixels
+  layout:
+    enabled: true           # false tolerates geometry changes of any size
+    tolerancePx: 2          # allow movement/resizing up to 2 CSS pixels on each axis
+```
+
+Set `maxChangedPixelRatio: 0` and `layout.tolerancePx: 0.5` to restore the previous sensitivity, or
+use `layout.tolerancePx: 0` to flag any movement or resize. The percentage is measured outside masks
+and ignored elements, against the whole compared screenshot area. It is separate from `antialiasTolerance`, which controls how
+different two pixel colors must be to count as changed. Both boundaries are inclusive.
+
+Confirmed text, style, structural, and accessibility edits remain significant even below the pixel
+allowance when their finding kinds are enabled. Disabled or excluded semantic findings cannot
+override the pixel allowance; with `findings: false`, attribute churn cannot promote a minor
+repaint into a changed step. Layout is evaluated independently: movement above its tolerance still
+flags a change with a small pixel footprint. Pixels explained by tolerated geometry are removed from the PR's
+percentage; an unexplained repaint inside a moved element still counts. This check is conservative:
+resampling or rasterization differences that cannot be explained by the captured geometry remain
+subject to the pixel allowance. Trace imports without element geometry use pixel evidence only.
+
+The HTML report retains raw percentages, findings, and overlays, labels minor changes “within
+tolerance,” and has a **show minor changes** toggle (on by default). When only minor changes remain,
+the PR comment says **No changes above the configured thresholds** and links to the full report.
+After changing the configuration, rerun the diff/export/review commands; cached comparisons are
+invalidated, and previews or AI reviews from an older tolerance decision are not reused in the PR.
+
+When AI review is enabled, the same review call also assesses findings and whole screenshots as
+meaningful, likely capture noise, uncertain, or incomplete captures, with an evidence-based reason.
+High-confidence noise can be omitted from PR comments and previews only when both before/after
+screenshots were actually supplied. Automatic exclusions are limited to pixel-only and layout
+findings; high-severity and confirmed semantic, structural, and accessibility findings stay visible.
+The model usually sees the top three changed views, so unreviewed views remain visible too.
+
+Uncertain findings stay in the comment. Loading/skeleton mismatches produce a capture-readiness
+concern, not a clean result. Missing, failed, or stale AI reviews fall back to threshold-based
+reporting. The HTML report and JSON retain all measured evidence; the HTML review panel includes
+the AI assessments and their reasons. AI confidence is a model assessment, not a calibrated
+probability. CI gates continue to use the measured thresholds, even when AI filters the comment.
+Rerun export with `--preview` after a new review: previews require a matching evidence/assessment
+stamp, and outdated or unstamped previews are omitted from comments.
+
+Loading states need a readiness condition: use a step's `waitFor` or an `expect` visibility check
+for the intended screen. A stable skeleton can still be the wrong state to capture; the percentage
+alone cannot identify that condition. Capture warnings about outstanding requests remain visible.
+
+Findings are claims about a change you can be shown, so a step whose two screenshots are identical
+reports none: the pixel-free accessibility pass and the page-size check are gated on the pixels
+moving, and `steps changed` counts pixel movement rather than findings. A new console error on an
+otherwise identical step is still reported — it just does not make the frame read as changed.
+
+Both report channels can be turned off, per project or per invocation. The pixel diff, the regions
+and the overlays are computed either way, so you keep the pictures:
+
+```yaml
+# .visual-diff/config.yaml
+diff:
+  minRegionArea: 64                     # regions smaller than this are dropped
+  antialiasTolerance: 0.1
+  ignore: ["[data-test=session-id]"]    # no region, no finding, no page-size claim
+  kinds: [content, style, layout, a11y] # which kinds to report; every kind by default
+  findings: false                       # or drop the channel entirely: pixels only
+  warnings: false                       # store an empty warnings list
+
+capture:
+  a11y: false                           # skip the accessibility snapshot (nothing reads the file)
+  console: false                        # stop recording console output
+  network: false                        # ...and the per-request diagnostics
+```
+
+Reach for `kinds` before `findings: false`. The usual complaint is one channel — two replays against
+a shared backend differ in their console and network traffic for reasons that have nothing to do with
+the change under review — and dropping those two keeps the layout, style, content and accessibility
+findings that no backend noise can manufacture. `capture:` is the same decision one step earlier: do
+not even record it. Turning `console` or `network` off leaves HAR record/replay and the hit/miss
+accounting untouched.
+
+A run stamps what it did not collect, and the diff folds an uncaptured channel into the same "not
+looked for" list, so a run that recorded its console is never compared against one that did not and
+reported as a page of resolved errors.
+
+```sh
+vdiff diff checkout --no-findings --no-warnings   # the same switches for one invocation
+```
+
+`vdiff diff` says which channel is off, and so does the pull-request comment — an empty findings
+list means "nothing was found" or "nothing was looked for", and those must not read alike.
 
 ### Flows behind a login
 
@@ -190,6 +456,19 @@ steps:
     waitFor: "[data-test=account-menu]"
     shoot: false
 ```
+
+`${VAR}` works in `goto` paths too, and either place accepts a shell-style default. A flow whose
+addresses are rows in a developer's database — a project id, a thread id — names the local value as
+the default and lets CI override it, so one committed flow drives both:
+
+```yaml
+steps:
+  - id: orders
+    goto: /projects/${VDIFF_PROJECT:-7c2e9a10-4f3b-4d2e-9b1a-0c5d6e7f8a90}/orders
+```
+
+A default is committed text and is never handed to the HAR scrubber; a `goto` value is never
+scrubbed at all, because the resolved URL is what the recording must match on replay.
 
 The storage-state file is what Playwright's `context.storageState({ path })` writes after a login;
 an existing Playwright auth setup project produces one already, and
@@ -229,6 +508,10 @@ the lifecycle script and commit the three files it touches) — the `version` li
 `scripts/sync-version.mjs`, which is the only thing that should ever write `TOOL_VERSION` in
 `src/version.ts` and the `version` input default in `action.yml`. Editing `package.json` by hand
 skips it, and the release then fails on `src/version.test.ts` after publishing nothing.
+
+Push the version tag to publish. After npm publication and the GitHub Release succeed, the
+workflow advances the matching major action tag (`v0`, `v1`, etc.). Prereleases and dry runs
+do not advance it, and rerunning an older release cannot move it backwards.
 
 `build` empties `dist/` first. `tsc` only ever adds to its `outDir`, so without that step the
 compiled remains of a deleted module stay on disk and ship to every consumer — the published tree

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { findProjectRoot, loadConfig, loadConfigOrThrow, parseConfigSource } from './config.js';
 import { DEFAULT_KEEP_E2E_RUNS, keepE2eRunsOf } from './internal/e2e.js';
 import { DEFAULT_KEEP_VARIANT_RUNS, keepVariantRunsOf } from './internal/variant.js';
-import { DEFAULTS } from '../types.js';
+import { DEFAULTS, FINDING_KINDS } from '../types.js';
 
 const FILE = '/projects/shop/.visual-diff/config.yaml';
 const ROOT = '/projects/shop';
@@ -21,6 +21,38 @@ function parse(source: string) {
 }
 
 describe('parseConfigSource', () => {
+  it('enables pixel and layout tolerances by default', () => {
+    const result = parse(MINIMAL);
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.diff.maxChangedPixelRatio).toBe(0.003);
+    expect(result.value.diff.layout).toEqual({ enabled: true, tolerancePx: 2 });
+  });
+
+  it('keeps explicit strict settings and defaults omitted layout fields', () => {
+    const strict = parse(`${MINIMAL}\ndiff:\n  maxChangedPixelRatio: 0\n  layout: { tolerancePx: 0.5 }`);
+    if (!strict.ok) throw new Error(JSON.stringify(strict.issues));
+    expect(strict.value.diff.maxChangedPixelRatio).toBe(0);
+    expect(strict.value.diff.layout).toEqual({ enabled: true, tolerancePx: 0.5 });
+    const disabled = parse(`${MINIMAL}\ndiff:\n  layout: { enabled: false }`);
+    if (!disabled.ok) throw new Error(JSON.stringify(disabled.issues));
+    expect(disabled.value.diff.maxChangedPixelRatio).toBe(0.003);
+    expect(disabled.value.diff.layout).toEqual({ enabled: false, tolerancePx: 2 });
+  });
+
+  it('accepts independent pixel and layout tolerance controls', () => {
+    const result = parse(`${MINIMAL}\ndiff:\n  maxChangedPixelRatio: 0.003\n  layout:\n    enabled: false\n    tolerancePx: 2`);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.diff.maxChangedPixelRatio).toBe(0.003);
+    expect(result.value.diff.layout).toEqual({ enabled: false, tolerancePx: 2 });
+  });
+
+  it.each(['maxChangedPixelRatio: -1', 'maxChangedPixelRatio: 1.01',
+    'maxChangedPixelRatio: "0.3%"', 'layout: { tolerancePx: -1 }',
+    'layout: { enabled: "false" }', 'layout: { tolerance: 2 }'])('rejects invalid tolerance: %s', setting => {
+    expect(parse(`${MINIMAL}\ndiff:\n  ${setting}`).ok).toBe(false);
+  });
+
   it('resolves browser.storageState against the project root', () => {
     const result = parse(`${MINIMAL}\nbrowser:\n  storageState: .visual-diff/auth/state.json`);
     if (!result.ok) throw new Error(JSON.stringify(result.issues));
@@ -72,7 +104,14 @@ describe('parseConfigSource', () => {
       minRegionArea: 64,
       maxRegions: 40,
       antialiasTolerance: 0.1,
+      maxChangedPixelRatio: 0.003,
+      layout: { enabled: true, tolerancePx: 2 },
       ignore: ['[data-test=session-id]'],
+      // Both report channels default on and every kind is emitted; the §6 example names none of
+      // them (D54, D57).
+      findings: true,
+      warnings: true,
+      kinds: [...FINDING_KINDS],
     });
     expect(result.value.network).toEqual({ redact: ['x-api-key'], scrub: true });
     // The §6 example names only `keepRuns`; the variant and e2e buckets default beside it
@@ -93,6 +132,8 @@ describe('parseConfigSource', () => {
     expect(result.value.diff.maxRegions).toBe(DEFAULTS.diff.maxRegions);
     expect(result.value.diff.antialiasTolerance).toBe(DEFAULTS.diff.antialiasTolerance);
     expect(result.value.diff.ignore).toEqual([]);
+    expect(result.value.diff.findings).toBe(true);
+    expect(result.value.diff.warnings).toBe(true);
     expect(result.value.retention.keepRuns).toBe(DEFAULTS.retention.keepRuns);
     expect(result.value.retention.keepRuns).toBe(20);
     expect(keepVariantRunsOf(result.value.retention)).toBe(DEFAULT_KEEP_VARIANT_RUNS);
@@ -101,6 +142,49 @@ describe('parseConfigSource', () => {
     expect(result.value.app.readyTimeoutMs).toBe(DEFAULTS.readyTimeoutMs);
     expect(result.value.app.install).toBeUndefined();
     expect(result.value.baseUrl).toBeUndefined();
+  });
+
+  it('reads the two report channels off the file (D54)', () => {
+    const result = parse(
+      [MINIMAL, 'diff:', '  findings: false', '  warnings: false'].join('\n'),
+    );
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.diff.findings).toBe(false);
+    expect(result.value.diff.warnings).toBe(false);
+    // The noise controls are untouched by them: what is emitted and what is compared are two
+    // different questions.
+    expect(result.value.diff.minRegionArea).toBe(DEFAULTS.diff.minRegionArea);
+  });
+
+  it('refuses a report channel that is not a boolean', () => {
+    const result = parse([MINIMAL, 'diff:', '  findings: sometimes'].join('\n'));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.at.key).toBe('diff.findings');
+  });
+
+  it('narrows the finding kinds, de-duplicated and in vocabulary order (D57)', () => {
+    const result = parse(
+      [MINIMAL, 'diff:', '  kinds: [network, content, content]'].join('\n'),
+    );
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    // Written order and multiplicity are not the choice: this list is fingerprinted into the diff
+    // cache key, and two spellings of one decision must not key as two configurations.
+    expect(result.value.diff.kinds).toEqual(['content', 'network']);
+  });
+
+  it('refuses a kind outside the closed vocabulary', () => {
+    const result = parse([MINIMAL, 'diff:', '  kinds: [content, screenshots]'].join('\n'));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(JSON.stringify(result.issues)).toContain('kinds');
+  });
+
+  it('refuses an empty list, and names the switch that means it', () => {
+    const result = parse([MINIMAL, 'diff:', '  kinds: []'].join('\n'));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.message).toContain('findings: false');
   });
 
   it('does not let the file disable HAR scrubbing — only --no-scrub can (spec §6)', () => {
@@ -372,4 +456,118 @@ describe('project discovery', () => {
     await expect(loadConfigOrThrow({ cwd: tmp })).rejects.toMatchObject({ exitCode: 2 });
   });
 
+});
+
+describe('browser.ignoreHTTPSErrors', () => {
+  it('is carried through, alone or beside the storage state', () => {
+    const alone = parse(`${MINIMAL}\nbrowser:\n  ignoreHTTPSErrors: true`);
+    if (!alone.ok) throw new Error(JSON.stringify(alone.issues));
+    expect(alone.value.browser).toEqual({ ignoreHTTPSErrors: true });
+
+    const both = parse(
+      `${MINIMAL}\nbrowser:\n  storageState: .visual-diff/auth/state.json\n  ignoreHTTPSErrors: false`,
+    );
+    if (!both.ok) throw new Error(JSON.stringify(both.issues));
+    expect(both.value.browser).toEqual({
+      storageState: path.resolve(ROOT, '.visual-diff/auth/state.json'),
+      ignoreHTTPSErrors: false,
+    });
+  });
+
+  it('rejects a non-boolean', () => {
+    const result = parse(`${MINIMAL}\nbrowser:\n  ignoreHTTPSErrors: yes please`);
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('browser.maskColor', () => {
+  it('carries a hex colour through, and the keywords a project reaches for', () => {
+    const hex = parse(`${MINIMAL}\nbrowser:\n  maskColor: "#ffffff"`);
+    if (!hex.ok) throw new Error(JSON.stringify(hex.issues));
+    expect(hex.value.browser).toEqual({ maskColor: '#ffffff' });
+
+    for (const keyword of ['white', 'black', 'transparent']) {
+      const result = parse(`${MINIMAL}\nbrowser:\n  maskColor: ${keyword}`);
+      if (!result.ok) throw new Error(JSON.stringify(result.issues));
+      expect(result.value.browser).toEqual({ maskColor: keyword });
+    }
+  });
+
+  it('stays absent when the file does not set it, so the default is the only magenta', () => {
+    const result = parse(`${MINIMAL}\nbrowser:\n  ignoreHTTPSErrors: true`);
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.browser?.maskColor).toBeUndefined();
+    expect(DEFAULTS.maskColor).toBe('#ff00ff');
+  });
+
+  it('refuses a colour Playwright would not use, instead of falling back to magenta in silence', () => {
+    const result = parse(`${MINIMAL}\nbrowser:\n  maskColor: nearly-white`);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.at.key).toBe('browser.maskColor');
+  });
+});
+
+describe('capture', () => {
+  it('collects everything unless the file says otherwise', () => {
+    const result = parse(MINIMAL);
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.capture).toEqual({ a11y: true, console: true, network: true });
+  });
+
+  it('turns individual channels off', () => {
+    const result = parse([MINIMAL, 'capture:', '  a11y: false', '  console: false'].join('\n'));
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.capture).toEqual({ a11y: false, console: false, network: true });
+  });
+
+  it('rejects a key that is not a channel, rather than collecting everything anyway', () => {
+    const result = parse([MINIMAL, 'capture:', '  a11yTree: false'].join('\n'));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(JSON.stringify(result.issues)).toContain('a11yTree');
+  });
+});
+
+describe('browser.mask', () => {
+  it('turns the painting off, and the default leaves it on', () => {
+    const off = parse(`${MINIMAL}\nbrowser:\n  mask: false`);
+    if (!off.ok) throw new Error(JSON.stringify(off.issues));
+    expect(off.value.browser).toEqual({ mask: false });
+
+    const silent = parse(MINIMAL);
+    if (!silent.ok) throw new Error(JSON.stringify(silent.issues));
+    expect(silent.value.browser?.mask).toBeUndefined();
+  });
+
+  it('refuses a colour for a mask that paints nothing', () => {
+    const result = parse(`${MINIMAL}\nbrowser:\n  mask: false\n  maskColor: "#ffffff"`);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.at.key).toBe('browser.maskColor');
+    expect(result.issues[0]?.message).toContain('nothing is painted');
+  });
+
+  it('accepts a colour with the painting left on', () => {
+    const result = parse(`${MINIMAL}\nbrowser:\n  mask: true\n  maskColor: black`);
+    if (!result.ok) throw new Error(JSON.stringify(result.issues));
+    expect(result.value.browser).toEqual({ mask: true, maskColor: 'black' });
+  });
+});
+
+describe('app.stepTimeout', () => {
+  it('is parsed as a duration and absent when not written', () => {
+    const set = parse(`${MINIMAL}\n  stepTimeout: 90s`);
+    if (!set.ok) throw new Error(JSON.stringify(set.issues));
+    expect(set.value.app.stepTimeoutMs).toBe(90_000);
+    const unset = parse(MINIMAL);
+    if (!unset.ok) throw new Error(JSON.stringify(unset.issues));
+    expect('stepTimeoutMs' in unset.value.app).toBe(false);
+  });
+
+  it('refuses a unitless value, naming the key', () => {
+    const result = parse(`${MINIMAL}\n  stepTimeout: 90`);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.issues[0]?.message).toContain('app.stepTimeout');
+  });
 });

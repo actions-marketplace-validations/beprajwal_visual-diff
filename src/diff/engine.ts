@@ -10,6 +10,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
+  DEFAULTS,
   DIFF_ENGINE_VERSION,
   FINDING_KINDS,
   SEVERITIES,
@@ -44,6 +45,7 @@ import { loadRunDir } from './loadRun.js';
 import { cropImage, decodePng, encodePng } from './pixel.js';
 import { ignoreSelectorWarnings } from './selector.js';
 import { diffViewport } from './viewportDiff.js';
+import { resolvedTolerance, toleranceActive } from './tolerance.js';
 import type { ShotSide } from './viewportDiff.js';
 
 /** Image pixels of context kept around a region when cutting its crop. */
@@ -72,9 +74,13 @@ export function defaultDiffOptions(overrides: Partial<DiffEngineOptions> = {}): 
     minRegionArea: 64,
     maxRegions: 40,
     antialiasTolerance: 0.1,
+    maxChangedPixelRatio: DEFAULTS.diff.maxChangedPixelRatio,
+    layout: { ...DEFAULTS.diff.layout },
     ignore: [],
     engineVersion: DIFF_ENGINE_VERSION,
     deviceScaleFactor: 2,
+    emitFindings: true,
+    emitWarnings: true,
     ...overrides,
   };
 }
@@ -149,12 +155,10 @@ function summarize(flowDiff: readonly FlowDiffEntry[], steps: readonly StepDiff[
   }
 
   for (const step of steps) {
-    let count = step.findings.length;
     for (const vp of Object.values(step.viewports)) {
-      count += vp.findings.length;
       summary.maxPixelChangedRatio = Math.max(summary.maxPixelChangedRatio, vp.pixelChangedRatio);
     }
-    if (count > 0) summary.stepsChanged += 1;
+    if (pixelChanged(step)) summary.stepsChanged += 1;
     for (const finding of allFindings(step)) {
       summary.totalFindings += 1;
       summary.bySeverity[finding.severity] += 1;
@@ -162,6 +166,24 @@ function summarize(flowDiff: readonly FlowDiffEntry[], steps: readonly StepDiff[
     }
   }
   return summary;
+}
+
+/**
+ * Whether this step rendered differently: some compared viewport moved a pixel or changed size.
+ *
+ * `stepsChanged` is answered from the pixels alone (D53), not from the finding count. A step with a
+ * new console error and two identical screenshots is a step that did not change *visually*, and
+ * counting it would put the sentence "1/4 steps changed" on a pull request whose filmstrip shows
+ * four identical frames. The console finding is still reported; it is simply not a pixel claim.
+ *
+ * A viewport with a `missing` side was never compared, so it can say nothing either way.
+ */
+function pixelChanged(step: StepDiff): boolean {
+  for (const vp of Object.values(step.viewports)) {
+    if (vp.missing !== undefined) continue;
+    if (vp.pixelChangedRatio > 0 || vp.dimensionsChanged) return true;
+  }
+  return false;
 }
 
 function* allFindings(step: StepDiff): Generator<Finding> {
@@ -207,6 +229,29 @@ export async function diffRuns(
   // metas that make it, and `resolveDiffOptions` is idempotent so `computeDiff` may resolve too.
   const resolved = resolveDiffOptions(requestedOptions, base.meta, head.meta);
   const options = resolved.options;
+  // Absent means on, so a caller that assembles its own options — the report server, an embedder —
+  // is unaffected by the switches existing (D54).
+  const emitFindings = options.emitFindings !== false;
+  const emitWarnings = options.emitWarnings !== false;
+  // Absent means every kind (D57). Narrowed, it is an allowlist: a kind left out never reaches a
+  // reader, and the result says which list it ran with so an absent kind is not read as a clean
+  // one.
+  //
+  // A channel one of the two runs never recorded (D58) narrows it further, and has to: comparing a
+  // run that recorded its console against one that did not would report every line the base logged
+  // as "console error resolved" — a finding about the configuration, dressed as a fix. Folded into
+  // the same list rather than handled apart, so every sentence that explains an absent kind
+  // already explains this one.
+  const bothCaptured = (channel: 'console' | 'network'): boolean =>
+    base.meta.captured?.[channel] !== false && head.meta.captured?.[channel] !== false;
+  const effectiveKinds = (options.kinds ?? FINDING_KINDS).filter(
+    (kind) =>
+      (kind !== 'console' || bothCaptured('console')) &&
+      (kind !== 'network' || bothCaptured('network')),
+  );
+  const kindsNarrowed = effectiveKinds.length !== FINDING_KINDS.length;
+  const kinds = new Set<FindingKind>(effectiveKinds);
+  const wanted = (finding: Finding): boolean => kinds.has(finding.kind);
   warnings.push(...resolved.warnings);
 
   if (base.meta.flow !== head.meta.flow) {
@@ -245,11 +290,13 @@ export async function diffRuns(
     const baseStep = base.stepsById[entry.id];
     const headStep = head.stepsById[entry.id];
 
-    const stepFindings: Finding[] = [
-      ...structuralFindings(entry),
-      ...consoleFindings(entry.id, baseStep?.console ?? [], headStep?.console ?? []),
-      ...networkFindings(entry.id, baseStep?.network ?? [], headStep?.network ?? []),
-    ];
+    const stepFindings: Finding[] = emitFindings
+      ? [
+          ...structuralFindings(entry),
+          ...consoleFindings(entry.id, baseStep?.console ?? [], headStep?.console ?? []),
+          ...networkFindings(entry.id, baseStep?.network ?? [], headStep?.network ?? []),
+        ].filter(wanted)
+      : [];
 
     const viewports: Record<ViewportId, ViewportDiff> = {};
     const comparable = isComparable(entry.status);
@@ -363,6 +410,7 @@ export async function diffRuns(
   }
 
   const result: SourceAwareDiffResult = {
+    ...(toleranceActive(options) ? { tolerance: resolvedTolerance(options) } : {}),
     engineVersion: options.engineVersion,
     flow: head.meta.flow,
     pair: { base: base.meta.runId, head: head.meta.runId },
@@ -375,8 +423,19 @@ export async function diffRuns(
     flowDiff,
     steps,
     summary: summarize(flowDiff, steps),
-    warnings,
+    // Collected either way and dropped here, in one place: a warning suppressed at each of its
+    // dozen push sites is a switch that half works the day someone adds the thirteenth.
+    warnings: emitWarnings ? warnings : [],
   };
+  // Stamped only when something was off, so a diff of a project that never touches the switches
+  // stores exactly the JSON it stored before they existed.
+  if (!emitFindings || !emitWarnings || kindsNarrowed) {
+    result.emit = {
+      findings: emitFindings,
+      warnings: emitWarnings,
+      ...(kindsNarrowed ? { kinds: [...effectiveKinds] } : {}),
+    };
+  }
 
   return { result, artifacts };
 }

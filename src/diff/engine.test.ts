@@ -7,7 +7,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { DiffResult, DomNode, Finding, StepDiff } from '../types.js';
+import type { DiffEngineOptions, DiffResult, DomNode, Finding, StepDiff } from '../types.js';
 import { computeDiff, defaultDiffOptions } from './engine.js';
 import { createImage, decodePng } from './pixel.js';
 import {
@@ -130,6 +130,18 @@ function headRun(runId: string): FixtureRun {
       },
     ],
   };
+}
+
+/** Every kind present in a result, for asserting what a narrowed vocabulary let through. */
+function allKinds(result: DiffResult): Set<string> {
+  const kinds = new Set<string>();
+  for (const step of result.steps) {
+    for (const finding of step.findings) kinds.add(finding.kind);
+    for (const vp of Object.values(step.viewports)) {
+      for (const finding of vp.findings) kinds.add(finding.kind);
+    }
+  }
+  return kinds;
 }
 
 function stepOf(result: DiffResult, id: string): StepDiff {
@@ -430,9 +442,13 @@ describe('masked regions', () => {
       });
 
       const vp = masked.steps[0]?.viewports['1280x800'];
-      expect(vp?.pixelChangedRatio).toBeGreaterThan(0);
+      // Nor a percentage (D56). The two shots differ *only* inside the mask rect — which is what a
+      // capture with `browser.mask: false` looks like — and a step reported as "changed, 4% of
+      // pixels" with no region and no finding is a change nobody can act on or dismiss.
+      expect(vp?.pixelChangedRatio).toBe(0);
       expect(vp?.regions).toEqual([]);
       expect(vp?.findings).toEqual([]);
+      expect(masked.summary.stepsChanged).toBe(0);
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
@@ -508,5 +524,143 @@ describe('the warnings the engine hands the CLI and the report', () => {
     expect(result.warnings.filter((w) => w.startsWith('viewports ') || w.startsWith('baseUrl '))).toEqual(
       [],
     );
+  });
+});
+
+describe('the pixel gate and the emit switches (D53, D54)', () => {
+  let tmp: string;
+  let vdiffDir: string;
+
+  /** The head run, with a console error on `cart` — the step whose two screenshots are identical. */
+  function headWithQuietConsole(runId: string): FixtureRun {
+    const run = headRun(runId);
+    const cart = run.steps.find((s) => s.id === 'cart');
+    if (cart === undefined) throw new Error('no cart step in the fixture');
+    cart.console = [consoleEntry('cart', 'error', 'TypeError: cart is not a function')];
+    return run;
+  }
+
+  async function diffOf(
+    dir: string,
+    head: FixtureRun,
+    options: Partial<DiffEngineOptions> = {},
+  ): Promise<DiffResult> {
+    const runs = path.join(dir, 'runs', 'checkout');
+    await writeRunFixture(path.join(runs, '0003'), baseRun('0003'));
+    await writeRunFixture(path.join(runs, head.runId), head);
+    return computeDiff({
+      baseRunDir: path.join(runs, '0003'),
+      headRunDir: path.join(runs, head.runId),
+      vdiffDir: dir,
+      options: defaultDiffOptions({ deviceScaleFactor: 1, ...options }),
+    });
+  }
+
+  beforeAll(async () => {
+    tmp = await mkdtemp(path.join(os.tmpdir(), 'vdiff-gate-'));
+    vdiffDir = path.join(tmp, '.visual-diff');
+  });
+
+  afterAll(async () => {
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  it('counts only the steps that moved a pixel as changed', async () => {
+    const result = await diffOf(path.join(vdiffDir, 'a'), headWithQuietConsole('0007'));
+    const cart = stepOf(result, 'cart');
+
+    // `cart` has a new console error and two indistinguishable screenshots. The finding is
+    // reported; the step is not counted as changed, because nothing about it rendered differently.
+    expect(cart.findings.map((f) => f.kind)).toEqual(['console']);
+    expect(cart.viewports['1280x800']?.pixelChangedRatio).toBe(0);
+    expect(result.summary.stepsChanged).toBe(1);
+    expect(result.summary.byKind.console).toBe(2);
+  });
+
+  it('emits no findings and stamps the result with findings off', async () => {
+    const result = await diffOf(path.join(vdiffDir, 'b'), headRun('0008'), {
+      emitFindings: false,
+    });
+
+    expect(result.emit).toEqual({ findings: false, warnings: true });
+    expect(result.summary.totalFindings).toBe(0);
+    expect(result.steps.every((s) => s.findings.length === 0)).toBe(true);
+    expect(
+      result.steps.every((s) => Object.values(s.viewports).every((v) => v.findings.length === 0)),
+    ).toBe(true);
+
+    // The pictures survive: pixel change, the step count and the overlay are what they always were.
+    expect(result.summary.maxPixelChangedRatio).toBeGreaterThan(0);
+    expect(result.summary.stepsChanged).toBe(1);
+    const overlay = path.join(
+      vdiffDir,
+      'b',
+      'diffs',
+      'checkout',
+      '0003..0008',
+      'steps',
+      'pay-form',
+      '1280x800',
+      'pixel.png',
+    );
+    expect(await readFile(overlay)).toBeInstanceOf(Buffer);
+  });
+
+  it('stores an empty warnings list with warnings off, and keeps the findings', async () => {
+    const dir = path.join(vdiffDir, 'c');
+    const withWarnings = await diffOf(dir, headRun('0009'), { ignore: ['div > .clock'] });
+    expect(withWarnings.warnings.length).toBeGreaterThan(0);
+
+    const silent = await diffOf(dir, headRun('0009'), {
+      ignore: ['div > .clock'],
+      emitWarnings: false,
+      force: true,
+    });
+    expect(silent.warnings).toEqual([]);
+    expect(silent.emit).toEqual({ findings: true, warnings: false });
+    expect(silent.summary.totalFindings).toBeGreaterThan(0);
+  });
+
+  it('emits only the kinds the project asked for, and says which it left out', async () => {
+    const result = await diffOf(path.join(vdiffDir, 'e'), headWithQuietConsole('0011'), {
+      kinds: ['content', 'style', 'layout', 'a11y'],
+    });
+
+    // The console error on `cart` and the network findings on `pay-form` are gone; the pixel-backed
+    // findings that no shared backend can manufacture are still there.
+    expect(result.summary.byKind.console).toBe(0);
+    expect(result.summary.byKind.network).toBe(0);
+    expect(result.summary.byKind.structural).toBe(0);
+    expect(result.summary.totalFindings).toBeGreaterThan(0);
+    expect([...allKinds(result)].sort()).toEqual(['a11y', 'content', 'style']);
+
+    // Stamped, so an empty console list is not read as a quiet console.
+    expect(result.emit?.kinds).toEqual(['content', 'style', 'layout', 'a11y']);
+    expect(result.emit?.findings).toBe(true);
+  });
+
+  it('drops a channel one side never recorded, instead of reporting it as resolved (D58)', async () => {
+    // The head run recorded no console. The base did, and it has a console error in it: compared
+    // naively that becomes "console error resolved", a finding about the configuration.
+    const head = headWithQuietConsole('0012');
+    head.meta = { ...head.meta, captured: { console: false } };
+    const result = await diffOf(path.join(vdiffDir, 'f'), head);
+
+    expect(result.summary.byKind.console).toBe(0);
+    expect(result.emit?.kinds).toEqual([
+      'content',
+      'style',
+      'layout',
+      'structural',
+      'a11y',
+      'network',
+    ]);
+    // The kinds both runs did record are untouched.
+    expect(result.summary.byKind.network).toBeGreaterThan(0);
+  });
+
+  it('leaves the stamp off a diff computed with both channels on', async () => {
+    const result = await diffOf(path.join(vdiffDir, 'd'), headRun('0010'));
+    expect(result.emit).toBeUndefined();
   });
 });

@@ -15,21 +15,28 @@
 
 import {
   EXIT,
+  REVIEW_PROVIDERS,
   SCENARIO_NONE,
   type CliError,
   type NetworkMode,
+  type ReviewProvider,
   type RunId,
   type ScenarioName,
   type ViewportId,
 } from '../types.js';
 import {
+  DEFAULT_HTML_MODE,
   DEFAULT_IMAGE_SELECTION,
   GATE_LEVELS,
   GATE_NONE,
+  HTML_MODES,
   IMAGE_SELECTIONS,
   isGateLevel,
+  isHtmlMode,
   isImageSelection,
+  isReviewProvider,
   type GateLevel,
+  type HtmlMode,
   type ImageSelection,
 } from './ci.js';
 import { E2E_SOURCE_FORMATS, isE2eSourceFormat, type E2eSourceFormat } from './e2e.js';
@@ -61,6 +68,18 @@ export type Invocation =
       keep: boolean;
       continueOnError: boolean;
       noScrub: boolean;
+      /**
+       * CI overrides (CI spec D41). The origin the app is served at and the URL to probe for it,
+       * when a runner fronts the dev server on a different host than `.visual-diff/config.yaml`
+       * names for local work. Also read from `VDIFF_BASE_URL` / `VDIFF_READY_ON` by the command,
+       * because the composite action calls `vdiff run` without flags.
+       */
+      baseUrl?: string;
+      readyOn?: string;
+      /** Accept a self-signed certificate. Also `VDIFF_IGNORE_HTTPS_ERRORS=1`. */
+      ignoreHttpsErrors?: true;
+      /** Per-action timeout inside a step, from `--step-timeout 60s`. Also `VDIFF_STEP_TIMEOUT`. */
+      stepTimeoutMs?: number;
       json: boolean;
     }
   | {
@@ -119,6 +138,47 @@ export type Invocation =
        */
       e2e: boolean;
       json: boolean;
+      /**
+       * `--no-findings` / `--no-warnings`: the two report channels, off for this invocation
+       * (D54). The pixel diff, the regions and the overlays are computed either way. Both
+       * override `diff.findings` / `diff.warnings` in config.yaml, and — like `--no-net` and
+       * `--no-scrub` — they are flags in their own right, not negations of flags that exist.
+       */
+      noFindings?: boolean;
+      noWarnings?: boolean;
+    }
+  | {
+      /**
+       * `vdiff review <flow> [base] [head]` — ask a hosted model to read the stored diff and write
+       * the review an agent would have (CI spec D39). Persists `review.json` beside
+       * `findings.json`; `comment` and `export` pick it up from there.
+       */
+      kind: 'review';
+      flow: string;
+      base?: RunId;
+      head?: RunId;
+      scenario?: ScenarioName;
+      variant?: VariantName;
+      e2e: boolean;
+      /** Forces a provider. Absent: whichever API key the environment holds. */
+      provider?: ReviewProvider;
+      /** Model id. Absent: the provider's default. */
+      model?: string;
+      /** Changed cells to send screenshots for. Absent: the module default; 0 sends findings only. */
+      shots?: number;
+      /** File whose text describes the intended change — a pull request's title and body. */
+      context?: string;
+      /** Also write the review to this file. It is stored beside findings.json regardless. */
+      out?: string;
+      json: boolean;
+      /**
+       * `--no-findings` / `--no-warnings`: the two report channels, off for this invocation
+       * (D54). The pixel diff, the regions and the overlays are computed either way. Both
+       * override `diff.findings` / `diff.warnings` in config.yaml, and — like `--no-net` and
+       * `--no-scrub` — they are flags in their own right, not negations of flags that exist.
+       */
+      noFindings?: boolean;
+      noWarnings?: boolean;
     }
   | {
       /**
@@ -137,15 +197,30 @@ export type Invocation =
       imageBase?: string;
       artifactUrl?: string;
       artifactName?: string;
+      /** Hosted rendering of the full report page; rendered with the verdict, not the footer. */
+      reportUrl?: string;
+      /**
+       * The exported bundle directory. Read for one thing: whether `vdiff export --preview` left its
+       * captures there, so the comment can open with the picture of the report (D51). Nothing else
+       * in the comment comes from the bundle — the diff is read from the store as always.
+       */
+      bundle?: string;
       /** Opt-in threshold. `none` — the default — never gates (D30). */
       failOn: GateLevel;
-      maxFindings?: number;
       maxImages?: number;
       /** File to write instead of stdout. */
       out?: string;
       /** Overrides the marker an upserting transport searches for (D33). */
       marker?: string;
       json: boolean;
+      /**
+       * `--no-findings` / `--no-warnings`: the two report channels, off for this invocation
+       * (D54). The pixel diff, the regions and the overlays are computed either way. Both
+       * override `diff.findings` / `diff.warnings` in config.yaml, and — like `--no-net` and
+       * `--no-scrub` — they are flags in their own right, not negations of flags that exist.
+       */
+      noFindings?: boolean;
+      noWarnings?: boolean;
     }
   | {
       /** `vdiff export <flow> [base] [head]` — write the portable evidence bundle (CI spec §5). */
@@ -159,11 +234,23 @@ export type Invocation =
       /** Bundle directory. Defaults to `.visual-diff/exports/<flow>/<base>..<head>`. */
       out?: string;
       images: ImageSelection;
+      /** How `report.html` addresses its images: linked paths, embedded data URIs, or both pages. */
+      html: HtmlMode;
       /** Recorded in the bundle's own `summary.json` and rendered into its `comment.md`. */
       failOn: GateLevel;
       artifactUrl?: string;
       artifactName?: string;
+      /** Photograph the bundle's report page, light and dark, for the comment (D51). Needs Chromium. */
+      preview: boolean;
       json: boolean;
+      /**
+       * `--no-findings` / `--no-warnings`: the two report channels, off for this invocation
+       * (D54). The pixel diff, the regions and the overlays are computed either way. Both
+       * override `diff.findings` / `diff.warnings` in config.yaml, and — like `--no-net` and
+       * `--no-scrub` — they are flags in their own right, not negations of flags that exist.
+       */
+      noFindings?: boolean;
+      noWarnings?: boolean;
     }
   | { kind: 'serve'; port?: number; open: boolean; json: boolean }
   | { kind: 'feedback'; ack: boolean; json: boolean }
@@ -267,6 +354,10 @@ export const COMMANDS: Record<string, CommandSpec> = {
       'no-net': { type: 'boolean' },
       'continue-on-error': { type: 'boolean' },
       'no-scrub': { type: 'boolean' },
+      'base-url': { type: 'string' },
+      'ready-on': { type: 'string' },
+      'ignore-https-errors': { type: 'boolean' },
+      'step-timeout': { type: 'string' },
     }),
     minPositionals: 1,
     maxPositionals: 1,
@@ -293,12 +384,33 @@ export const COMMANDS: Record<string, CommandSpec> = {
     maxPositionals: 1,
   },
   diff: {
-    usage: 'vdiff diff <flow> [base] [head] [--scenario <name>] [--variant <name>] [--e2e]',
+    usage:
+      'vdiff diff <flow> [base] [head] [--scenario <name>] [--variant <name>] [--e2e] [--no-findings] [--no-warnings]',
     summary: 'compute and print summary (defaults: N-1 vs N)',
     flags: flags({
       scenario: { type: 'string' },
       variant: { type: 'string' },
       e2e: { type: 'boolean' },
+      'no-findings': { type: 'boolean' },
+      'no-warnings': { type: 'boolean' },
+    }),
+    minPositionals: 1,
+    maxPositionals: 3,
+  },
+  review: {
+    usage: 'vdiff review <flow> [base] [head] [--provider anthropic|openai] [--model <id>] [--context <file>]',
+    summary: 'have a model read a stored diff and write the review (needs an API key)',
+    flags: flags({
+      provider: { type: 'string' },
+      model: { type: 'string' },
+      shots: { type: 'number' },
+      context: { type: 'string' },
+      out: { type: 'string' },
+      scenario: { type: 'string' },
+      variant: { type: 'string' },
+      e2e: { type: 'boolean' },
+      'no-findings': { type: 'boolean' },
+      'no-warnings': { type: 'boolean' },
     }),
     minPositionals: 1,
     maxPositionals: 3,
@@ -311,32 +423,40 @@ export const COMMANDS: Record<string, CommandSpec> = {
     summary: 'render a stored diff as pull-request markdown',
     flags: flags({
       'image-base': { type: 'string' },
+      bundle: { type: 'string' },
       'artifact-url': { type: 'string' },
       'artifact-name': { type: 'string' },
+      'report-url': { type: 'string' },
       'fail-on': { type: 'string' },
-      'max-findings': { type: 'number' },
       'max-images': { type: 'number' },
       marker: { type: 'string' },
       out: { type: 'string' },
       scenario: { type: 'string' },
       variant: { type: 'string' },
       e2e: { type: 'boolean' },
+      'no-findings': { type: 'boolean' },
+      'no-warnings': { type: 'boolean' },
     }),
     minPositionals: 1,
     maxPositionals: 3,
   },
   export: {
-    usage: 'vdiff export <flow> [base] [head] [--out <dir>] [--images changed|all|none]',
+    usage:
+      'vdiff export <flow> [base] [head] [--out <dir>] [--images changed|all|none] [--html linked|inline|both] [--preview]',
     summary: 'write a portable evidence bundle: images, JSON, static HTML',
     flags: flags({
       out: { type: 'string' },
+      preview: { type: 'boolean' },
       images: { type: 'string' },
+      html: { type: 'string' },
       'artifact-url': { type: 'string' },
       'artifact-name': { type: 'string' },
       'fail-on': { type: 'string' },
       scenario: { type: 'string' },
       variant: { type: 'string' },
       e2e: { type: 'boolean' },
+      'no-findings': { type: 'boolean' },
+      'no-warnings': { type: 'boolean' },
     }),
     minPositionals: 1,
     maxPositionals: 3,
@@ -681,8 +801,19 @@ function applyPairFilters(
   spec: CommandSpec,
   values: Record<string, unknown>,
   wantsE2e: boolean,
-  target: { scenario?: ScenarioName; variant?: VariantName },
+  target: {
+    scenario?: ScenarioName;
+    variant?: VariantName;
+    noFindings?: boolean;
+    noWarnings?: boolean;
+  },
 ): ParseOutcome | null {
+  // The two emit switches ride along here rather than in each of the four `case` blocks: every
+  // command that resolves a pair also computes it when the store has none, so a switch one of them
+  // lacked would be a command that quietly reports the channel the others suppressed (D54).
+  if (bool(values, 'no-findings')) target.noFindings = true;
+  if (bool(values, 'no-warnings')) target.noWarnings = true;
+
   const scenario = values['scenario'];
   if (typeof scenario === 'string') {
     const invalid = checkScenarioName(command, scenario, 'filter');
@@ -716,6 +847,20 @@ function applyPairFilters(
   }
 
   return null;
+}
+
+/**
+ * `60s`, `2m`, `1500ms` → milliseconds; null for anything else. The same shape `config.yaml` takes
+ * for `readyTimeout` and `stepTimeout`, written here again because the parser must stay
+ * dependency-free (see the header) and a unitless number is refused on purpose — "30" as seconds
+ * or milliseconds is exactly the ambiguity a unit exists to remove.
+ */
+export function durationToMs(input: string): number | null {
+  const match = /^\s*(\d+(?:\.\d+)?)\s*(ms|s|m)\s*$/.exec(input);
+  if (match === null) return null;
+  const value = Number.parseFloat(match[1] as string);
+  const unit = { ms: 1, s: 1_000, m: 60_000 }[match[2] as 'ms' | 's' | 'm'];
+  return Math.round(value * unit);
 }
 
 function bool(values: Record<string, unknown>, name: string): boolean {
@@ -939,6 +1084,24 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       if (viewports !== undefined) invocation.viewports = viewports;
       if (record) invocation.network = 'record';
       if (noNet) invocation.network = 'off';
+      const baseUrl = values['base-url'];
+      if (typeof baseUrl === 'string') invocation.baseUrl = baseUrl;
+      const readyOn = values['ready-on'];
+      if (typeof readyOn === 'string') invocation.readyOn = readyOn;
+      if (bool(values, 'ignore-https-errors')) invocation.ignoreHttpsErrors = true;
+      const stepTimeout = values['step-timeout'];
+      if (typeof stepTimeout === 'string') {
+        const ms = durationToMs(stepTimeout);
+        if (ms === null) {
+          return fail(
+            'run',
+            'invalid-duration',
+            `--step-timeout '${stepTimeout}' needs a unit: 60s, 2m, 1500ms`,
+            spec.usage,
+          );
+        }
+        invocation.stepTimeoutMs = ms;
+      }
       return { ok: true, value: invocation };
     }
 
@@ -1056,6 +1219,51 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
       return { ok: true, value: invocation };
     }
 
+    case 'review': {
+      const wantsE2e = bool(values, 'e2e');
+      const provider = values['provider'];
+      if (typeof provider === 'string' && !isReviewProvider(provider)) {
+        return fail(
+          'review',
+          'invalid-provider',
+          `unknown --provider '${provider}'`,
+          `expected one of: ${REVIEW_PROVIDERS.join(', ')}`,
+        );
+      }
+      const invocation: Extract<Invocation, { kind: 'review' }> = {
+        kind: 'review',
+        flow: positionals[0] as string,
+        e2e: wantsE2e,
+        json,
+      };
+      if (typeof provider === 'string' && isReviewProvider(provider)) invocation.provider = provider;
+      applyPair(invocation, positionals);
+      const narrowed = applyPairFilters('review', spec, values, wantsE2e, invocation);
+      if (narrowed !== null) return narrowed;
+
+      for (const [flag, field] of [
+        ['model', 'model'],
+        ['context', 'context'],
+        ['out', 'out'],
+      ] as const) {
+        const value = values[flag];
+        if (typeof value === 'string') invocation[field] = value;
+      }
+      const shots = values['shots'];
+      if (typeof shots === 'number') {
+        if (!Number.isInteger(shots) || shots < 0) {
+          return fail(
+            'review',
+            'invalid-cap',
+            `--shots must be a non-negative whole number, got '${shots}'`,
+            spec.usage,
+          );
+        }
+        invocation.shots = shots;
+      }
+      return { ok: true, value: invocation };
+    }
+
     case 'comment': {
       const wantsE2e = bool(values, 'e2e');
       const level = values['fail-on'];
@@ -1080,8 +1288,10 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
 
       for (const [flag, field] of [
         ['image-base', 'imageBase'],
+        ['bundle', 'bundle'],
         ['artifact-url', 'artifactUrl'],
         ['artifact-name', 'artifactName'],
+        ['report-url', 'reportUrl'],
         ['marker', 'marker'],
         ['out', 'out'],
       ] as const) {
@@ -1089,7 +1299,6 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
         if (typeof value === 'string') invocation[field] = value;
       }
       for (const [flag, field] of [
-        ['max-findings', 'maxFindings'],
         ['max-images', 'maxImages'],
       ] as const) {
         const value = values[flag];
@@ -1118,6 +1327,15 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
           `expected one of: ${IMAGE_SELECTIONS.join(', ')}`,
         );
       }
+      const html = values['html'];
+      if (typeof html === 'string' && !isHtmlMode(html)) {
+        return fail(
+          'export',
+          'invalid-html',
+          `unknown --html mode '${html}'`,
+          `expected one of: ${HTML_MODES.join(', ')}`,
+        );
+      }
       const level = values['fail-on'];
       if (typeof level === 'string' && !isGateLevel(level)) {
         return fail(
@@ -1132,7 +1350,9 @@ export function parseArgs(argv: readonly string[]): ParseOutcome {
         flow: positionals[0] as string,
         e2e: wantsE2e,
         images: typeof images === 'string' ? images : DEFAULT_IMAGE_SELECTION,
+        html: typeof html === 'string' ? html : DEFAULT_HTML_MODE,
         failOn: typeof level === 'string' ? level : GATE_NONE,
+        preview: bool(values, 'preview'),
         json,
       };
       applyPair(invocation, positionals);

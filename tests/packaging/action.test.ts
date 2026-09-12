@@ -91,6 +91,11 @@ describe('action.yml', () => {
     // the set is pinned rather than merely non-empty.
     expect(Object.keys(action.inputs).sort()).toEqual(
       [
+        'anthropic-api-key',
+        'anthropic-federation-rule-id',
+        'anthropic-organization-id',
+        'anthropic-service-account-id',
+        'anthropic-workspace-id',
         'artifact',
         'artifact-name',
         'base-ref',
@@ -100,11 +105,18 @@ describe('action.yml', () => {
         'fail-on',
         'flows',
         'github-token',
+        'app-id',
+        'app-private-key',
+        'head-network',
+        'html',
         'images',
         'install',
         'mode',
         'node-version',
+        'openai-api-key',
+        'pages-url',
         'publish-branch',
+        'review-model',
         'version',
         'working-directory',
       ].sort(),
@@ -125,17 +137,28 @@ describe('action.yml', () => {
 
   it('reports the numbers a caller would gate or badge on', () => {
     expect(Object.keys(action.outputs).sort()).toEqual(
-      ['artifact-url', 'bundle-dir', 'changed-steps', 'comment-file', 'findings', 'gate', 'high'].sort(),
+      [
+        'artifact-url',
+        'bundle-dir',
+        'changed-steps',
+        'comment-file',
+        'findings',
+        'gate',
+        'high',
+        'report-url',
+        'reviewed',
+      ].sort(),
     );
   });
 
-  it('takes the token in exactly the two steps that talk to GitHub (D29)', () => {
+  it('takes the token in exactly the three steps that talk to GitHub (D29, D52)', () => {
     const withToken = action.runs.steps.filter((step) => {
       // A `with:`/`env:` value can be a boolean or a number in YAML, so stringify before matching.
       const values = [...Object.values(step.with ?? {}), ...Object.values(step.env ?? {})];
       return values.some((value) => String(value).includes('inputs.github-token'));
     });
     expect(withToken.map((step) => step.name ?? step.uses)).toEqual([
+      'Find the Pages site',
       'Publish diff images',
       'Post the comment',
     ]);
@@ -286,5 +309,217 @@ describe('the workflows vdiff install github-actions writes', () => {
     const baseline = parseYaml(baselineWorkflow(composed)) as WorkflowYaml;
     expect(pr.permissions?.['pull-requests']).toBe('write');
     expect(baseline.permissions).toEqual({ contents: 'read' });
+  });
+});
+
+describe('the review and the hosted report (D39, D40)', () => {
+  it('hands the model API keys to exactly one step, and never alongside the GitHub token', () => {
+    const withKeys = action.runs.steps.filter((step) => {
+      const values = [...Object.values(step.with ?? {}), ...Object.values(step.env ?? {})];
+      return values.some(
+        (value) =>
+          String(value).includes('inputs.anthropic-api-key') ||
+          String(value).includes('inputs.openai-api-key'),
+      );
+    });
+    expect(withKeys.map((step) => step.name)).toEqual(['Diff, review and export']);
+    const step = withKeys[0]!;
+    // The key lands in the variable the CLI reads, and the step holds no GitHub credential (D29).
+    expect(step.env?.['ANTHROPIC_API_KEY']).toBe('${{ inputs.anthropic-api-key }}');
+    expect(step.env?.['OPENAI_API_KEY']).toBe('${{ inputs.openai-api-key }}');
+    expect(JSON.stringify(step.env)).not.toContain('github-token');
+    expect(JSON.stringify(step.env)).not.toContain('github.token');
+  });
+
+  it('reviews only when a key is present, before the export, and never fails the job over it', () => {
+    const step = action.runs.steps.find((s) => s.name === 'Diff, review and export');
+    expect(step?.run).toBeDefined();
+    const run = step!.run!;
+    expect(run).toContain('if [ -n "${ANTHROPIC_API_KEY}${ANTHROPIC_AUTH_TOKEN}${OPENAI_API_KEY}" ]; then');
+    expect(run.indexOf('review "$flow"')).toBeLessThan(run.indexOf('export "$flow"'));
+    expect(run).toContain('::warning::vdiff review failed');
+    // The pull request's own description is what the model judges "unrelated" against.
+    expect(step!.env?.['PR_TITLE']).toBe('${{ github.event.pull_request.title }}');
+    expect(run).toContain('--context "$context_file"');
+  });
+
+  it('links the hosted report only when both publish-branch and pages-url are set', () => {
+    const publish = action.runs.steps.find((s) => s.name === 'Publish diff images');
+    expect(publish?.env?.['PAGES_URL']).toBe('${{ inputs.pages-url || steps.pages.outputs.url }}');
+    expect(publish?.run).toContain('report_base=');
+    const render = action.runs.steps.find((s) => s.name === 'Render the comment');
+    expect(render?.env?.['REPORT_BASE']).toBe('${{ steps.publish.outputs.report_base }}');
+    expect(render?.run).toContain('--report-url "$REPORT_BASE/$flow/report.html"');
+    // Defaults: no key, no page — the action behaves exactly as it did before either existed.
+    expect(action.inputs['anthropic-api-key']?.default).toBe('');
+    expect(action.inputs['openai-api-key']?.default).toBe('');
+    expect(action.inputs['pages-url']?.default).toBe('');
+  });
+});
+
+describe('the recordings travel with the baseline (D42)', () => {
+  it('caches each flow HAR beside the runs, on save and on restore, under the same key', () => {
+    const restore = action.runs.steps.find((s) => s.name === 'Restore baseline runs');
+    const save = action.runs.steps.find((s) => s.name === 'Save the baseline');
+    for (const step of [restore, save]) {
+      expect(step?.uses).toMatch(/^actions\/cache\/(restore|save)@v4$/);
+      const paths = String(step?.with?.['path']).split('\n').map((p) => p.trim()).filter(Boolean);
+      expect(paths).toEqual([
+        '${{ inputs.working-directory }}/.visual-diff/runs',
+        '${{ inputs.working-directory }}/.visual-diff/flows/*.har',
+      ]);
+    }
+    // Same key shape on both sides, or the restore can never hit what the save wrote.
+    expect(String(restore?.with?.['key']).replace(/\$\{\{ steps\.resolve\.outputs\.base_sha \}\}/, 'SHA'))
+      .toBe(String(save?.with?.['key']).replace(/\$\{\{ github\.sha \}\}/, 'SHA'));
+  });
+});
+
+describe('keyless review through Workload Identity Federation (D43)', () => {
+  it('mints the bearer once, in its own step, and hands it to the review step alone', () => {
+    const mint = action.runs.steps.find((s) => s.id === 'oidc');
+    expect(mint?.name).toBe('Mint an Anthropic token from the runner identity');
+    expect(mint?.uses).toBe('actions/github-script@v7');
+    // Only when a rule is named and no key is: a key would win precedence anyway (SDK order).
+    expect(mint?.if).toContain("inputs.anthropic-federation-rule-id != ''");
+    expect(mint?.if).toContain("inputs.anthropic-api-key == ''");
+    // The exchange is one request: getIDToken, then POST /v1/oauth/token, then a masked output.
+    const script = String(mint?.with?.['script']);
+    expect(script).toContain("core.getIDToken('https://api.anthropic.com')");
+    expect(script).toContain('/v1/oauth/token');
+    expect(script).toContain('urn:ietf:params:oauth:grant-type:jwt-bearer');
+    expect(script).toContain('core.setSecret(');
+
+    const review = action.runs.steps.find((s) => s.name === 'Diff, review and export');
+    expect(review?.env?.['ANTHROPIC_AUTH_TOKEN']).toBe('${{ steps.oidc.outputs.token }}');
+    expect(review?.run).toContain('${ANTHROPIC_API_KEY}${ANTHROPIC_AUTH_TOKEN}${OPENAI_API_KEY}');
+
+    // The federation ids reach exactly the minting step.
+    const withFederation = action.runs.steps.filter((step) =>
+      JSON.stringify({ with: step.with, env: step.env }).includes('inputs.anthropic-federation-rule-id'),
+    );
+    expect(withFederation.map((s) => s.name)).toEqual(['Mint an Anthropic token from the runner identity']);
+    for (const input of ['anthropic-federation-rule-id', 'anthropic-organization-id', 'anthropic-service-account-id', 'anthropic-workspace-id']) {
+      expect(action.inputs[input]?.default).toBe('');
+    }
+  });
+});
+
+describe('the head side records by default (D48)', () => {
+  it('records the working tree unless head-network says replay, and validates the input', () => {
+    expect(action.inputs['head-network']?.default).toBe('record');
+    const head = action.runs.steps.find((s) => s.name === 'Replay the working tree');
+    expect(head?.env?.['HEAD_NETWORK']).toBe('${{ inputs.head-network }}');
+    expect(head?.run).toContain('$cli run "$flow" --record');
+    const resolve = action.runs.steps.find((s) => s.id === 'resolve');
+    expect(resolve?.run).toContain('head-network must be record or replay');
+    // The base side still replays whatever the cache restored: only the head has new traffic.
+    const base = action.runs.steps.find((s) => s.name === 'Replay the base revision');
+    expect(base?.run).not.toContain('--record');
+  });
+});
+
+describe('a denied token exchange never fails the job (D43)', () => {
+  it('warns and leaves the token empty instead of calling setFailed', () => {
+    const mint = action.runs.steps.find((s) => s.id === 'oidc');
+    const script = String(mint?.with?.['script']);
+    expect(script).not.toContain('core.setFailed(');
+    expect(script).toContain("core.setOutput('token', '')");
+    expect(script.match(/core\.warning\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('the comment can be signed by a GitHub App (D49)', () => {
+  const mintStep = () => action.runs.steps.find((s) => s.id === 'app');
+
+  it('mints an installation token only in pr mode and only when an app is named', () => {
+    const mint = mintStep();
+    expect(mint?.uses).toMatch(/^actions\/create-github-app-token@v\d+$/);
+    expect(mint?.if).toContain("inputs.mode == 'pr'");
+    expect(mint?.if).toContain("inputs.app-id != ''");
+    expect(mint?.with?.['app-id']).toBe('${{ inputs.app-id }}');
+    expect(mint?.with?.['private-key']).toBe('${{ inputs.app-private-key }}');
+  });
+
+  it('signs the comment, and only the comment — the publish keeps the workflow token', () => {
+    const publish = action.runs.steps.find((s) => s.id === 'publish');
+    const comment = action.runs.steps.find((s) => s.name === 'Post the comment');
+    expect(comment?.with?.['github-token']).toBe('${{ steps.app.outputs.token || inputs.github-token }}');
+    expect(publish?.env?.['GH_TOKEN']).toBe('${{ inputs.github-token }}');
+  });
+
+  it('defaults both app inputs to empty so nothing changes for a workflow that names no app', () => {
+    expect(action.inputs['app-id']?.default).toBe('');
+    expect(action.inputs['app-private-key']?.default).toBe('');
+  });
+});
+
+describe('publishing to a private repository (D50)', () => {
+  const publishRun = () => String(action.runs.steps.find((s) => s.id === 'publish')?.run);
+
+  it('clones with the token, not anonymously', () => {
+    const run = publishRun();
+    expect(run).toContain('remote="https://x-access-token:${GH_TOKEN}@${SERVER#https://}/${REPO}.git"');
+    expect(run).not.toMatch(/git clone[^\n]*"\$\{SERVER\}\/\$\{REPO\}\.git"/);
+  });
+
+  it('addresses the comment images through github.com, the one form a private repository renders', () => {
+    const run = publishRun();
+    expect(run).toContain('echo "image_base=${SERVER}/${REPO}/raw/${BRANCH}/${prefix}"');
+    expect(run).not.toContain('image_base=${PAGES_URL');
+    expect(run).not.toContain('image_base=https://raw.githubusercontent.com');
+  });
+});
+
+describe('the picture of the report (D51)', () => {
+  it('is taken by the export only when there is somewhere to publish it', () => {
+    const step = action.runs.steps.find((s) => s.id === 'export');
+    const run = String(step?.run);
+    expect(step?.env?.['PUBLISH_BRANCH']).toBe('${{ inputs.publish-branch }}');
+    expect(run).toContain('if [ -n "$PUBLISH_BRANCH" ]; then preview="--preview"; fi');
+    expect(run.match(/\$cli export [^\n]*\$preview/g)?.length).toBe(2);
+  });
+
+  it('is offered to the comment from the bundle, under the same image base', () => {
+    const step = action.runs.steps.find((s) => s.id === 'render');
+    const run = String(step?.run);
+    expect(run).toContain('--image-base "$IMAGE_BASE/$flow" --bundle "$BUNDLE_ROOT/$flow"');
+  });
+});
+
+describe('the app owns the comment (D49, amended)', () => {
+  it('replaces a comment posted by another identity instead of editing it', () => {
+    const step = action.runs.steps.find((s) => s.name === 'Post the comment');
+    const script = String(step?.with?.['script']);
+    expect(step?.env?.['APP_SLUG']).toBe('${{ steps.app.outputs.app-slug }}');
+    expect(script).toContain("previous.user?.login !== appLogin");
+    expect(script).toContain('github.rest.issues.deleteComment');
+  });
+});
+
+describe('the Pages site is asked for, not configured (D52)', () => {
+  const find = () => action.runs.steps.find((s) => s.id === 'pages');
+
+  it('runs only when there is a publish branch and no pages-url was given, in pr mode', () => {
+    const step = find();
+    expect(step?.uses).toMatch(/^actions\/github-script@v\d+$/);
+    expect(step?.if).toContain("inputs.mode == 'pr'");
+    expect(step?.if).toContain("inputs.publish-branch != ''");
+    expect(step?.if).toContain("inputs.pages-url == ''");
+    expect(step?.with?.['github-token']).toBe('${{ inputs.github-token }}');
+  });
+
+  it('uses the site only when it deploys from the publish branch, and never fails the job', () => {
+    const script = String(find()?.with?.['script']);
+    expect(script).toContain('github.rest.repos.getPages');
+    expect(script).toContain("site.source?.branch !== process.env.BRANCH");
+    expect(script).toContain("core.setOutput('url', '')");
+    expect(script).not.toContain('core.setFailed(');
+    expect(script.match(/core\.warning\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+  });
+
+  it('feeds the publish step, with an explicit pages-url taking precedence', () => {
+    const publish = action.runs.steps.find((s) => s.id === 'publish');
+    expect(publish?.env?.['PAGES_URL']).toBe('${{ inputs.pages-url || steps.pages.outputs.url }}');
   });
 });

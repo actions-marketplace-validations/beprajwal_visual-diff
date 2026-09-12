@@ -43,6 +43,15 @@ inputs:
     description: 'auto | cache | replay — where the base side comes from (D32).'
     required: false
     default: auto
+  head-network:
+    description: >-
+      record | replay — how the head side reaches the network (D48). `record` (the default) lets the
+      pull request's code talk to the live backend and records what it saw: a change that adds or
+      alters a request is the thing under review, and a recording made by the base has no answer
+      for it. `replay` serves the head from the base's recording instead, which is deterministic
+      but fails any step whose requests the base never made.
+    required: false
+    default: record
   fail-on:
     description: >-
       none | high | any. Default none: findings are reported and the check stays green (D30).
@@ -52,6 +61,15 @@ inputs:
     description: 'changed | all | none — which shots the evidence bundle carries.'
     required: false
     default: changed
+  html:
+    description: >-
+      linked | inline | both — how the bundle's report.html addresses its images. `linked` (the
+      default) uses relative paths into images/. `inline` embeds them as data: URIs, so the one file
+      is the whole report — the shape to pick when something serves or shares it as a single object.
+      `both` writes the linked page plus a self-contained report.inline.html beside it. Anything but
+      `linked` needs a CLI newer than 0.5.2 — mind that when pinning `cli:` yourself.
+    required: false
+    default: linked
   comment:
     description: 'Post (or update) the pull-request comment.'
     required: false
@@ -71,6 +89,57 @@ inputs:
       one (D31). Requires contents: write.
     required: false
     default: ''
+  pages-url:
+    description: >-
+      URL GitHub Pages serves `publish-branch` at. Usually left empty: with `publish-branch` set the
+      action asks the Pages API for the site's URL and uses it when the site deploys from that branch
+      (D52; grant the workflow `pages: read`). Set it to override — a custom domain, a site the token
+      may not read. Either way the comment's "Open the full report" opens this pull request's
+      report.html as a page (D40). Who can see it is the repository's Pages visibility: private on
+      GitHub Enterprise Cloud, public otherwise. Ignored without `publish-branch`.
+    required: false
+    default: ''
+  anthropic-api-key:
+    description: >-
+      Anthropic API key, from a repository secret. Set it and `vdiff review` asks the model to read
+      each diff and write the review the comment opens with — the headline change, what is not
+      accounted for by the pull request's description, what looks broken (D39). The key reaches the
+      review step only. Empty skips the review; the comment then carries the numbers alone.
+    required: false
+    default: ''
+  openai-api-key:
+    description: >-
+      OpenAI API key, the same way. When both keys are set, Anthropic is used.
+    required: false
+    default: ''
+  review-model:
+    description: >-
+      Model id for the review. Empty uses the provider's default (`claude-opus-5` / `gpt-6-astra`).
+    required: false
+    default: ''
+  anthropic-federation-rule-id:
+    description: >-
+      Keyless review through Anthropic Workload Identity Federation (D43): the `fdrl_…` rule that
+      trusts this repository's GitHub OIDC token. Set it, with the organization and service-account
+      ids below, and the job mints a short-lived Anthropic token from its own identity instead of
+      reading a stored key. The workflow must grant `id-token: write`. Ignored when
+      `anthropic-api-key` is set — a key wins, as it does in the SDK.
+    required: false
+    default: ''
+  anthropic-organization-id:
+    description: 'Anthropic organization UUID, for federation.'
+    required: false
+    default: ''
+  anthropic-service-account-id:
+    description: 'The `svac_…` service account the federation rule targets.'
+    required: false
+    default: ''
+  anthropic-workspace-id:
+    description: >-
+      The `wrkspc_…` workspace to scope the minted token to. Required only when the rule is enabled
+      for more than one workspace.
+    required: false
+    default: ''
   install:
     description: >-
       Command that installs the project's dependencies before the head run. Empty auto-detects from
@@ -84,7 +153,7 @@ inputs:
   version:
     description: 'Version of @beprajwal/visual-diff to install. Ignored when `cli` is set.'
     required: false
-    default: '0.6.0'
+    default: '0.19.4'
   cli:
     description: >-
       Command that invokes the CLI. Empty — the default — installs the package globally and calls
@@ -98,9 +167,23 @@ inputs:
     required: false
     default: '.'
   github-token:
-    description: 'Token used by the comment and publish steps only.'
+    description: >-
+      Token used by the comment and publish steps only. The comment's author is this token's
+      identity: github-actions by default. Ignored when `app-id` is set.
     required: false
     default: ${{ github.token }}
+  app-id:
+    description: >-
+      Id of a GitHub App to comment as (D49). Create one named "Visual Diff" in the organization,
+      give it the logo, grant it pull requests: read and write (nothing else — the publish step uses
+      `github-token`), install it on the repository, and the comment carries the app's name and
+      avatar instead of github-actions. Requires `app-private-key`.
+    required: false
+    default: ''
+  app-private-key:
+    description: 'Private key of the GitHub App named by `app-id`. Pass it from a secret.'
+    required: false
+    default: ''
 
 outputs:
   findings:
@@ -124,6 +207,14 @@ outputs:
   artifact-url:
     description: 'URL of the uploaded bundle, when one was uploaded.'
     value: ${{ steps.upload.outputs.artifact-url }}
+  report-url:
+    description: >-
+      URL of the first flow's report.html as a page, when `publish-branch` and `pages-url` are both
+      set (D40). One page per flow lives under the same prefix.
+    value: ${{ steps.render.outputs.report_url }}
+  reviewed:
+    description: 'true when a model wrote the review for at least one flow (D39); false otherwise.'
+    value: ${{ steps.export.outputs.reviewed }}
 
 runs:
   using: composite
@@ -143,14 +234,23 @@ runs:
         BASELINE: ${{ inputs.baseline }}
         FAIL_ON: ${{ inputs.fail-on }}
         IMAGES: ${{ inputs.images }}
+        HEAD_NETWORK: ${{ inputs.head-network }}
+        PUBLISH_BRANCH: ${{ inputs.publish-branch }}
+        PAGES_URL: ${{ inputs.pages-url }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: |
         set -euo pipefail
 
         case "$MODE" in pr|baseline) ;; *) echo "::error::mode must be pr or baseline, got '$MODE'"; exit 2 ;; esac
+        # A Pages URL without a branch to serve has nothing to point at. Said once here rather than
+        # discovered from a comment whose call to action 404s (D40).
+        if [ -n "$PAGES_URL" ] && [ -z "$PUBLISH_BRANCH" ]; then
+          echo "::warning::pages-url is set but publish-branch is empty — nothing is published, so the comment will not link a hosted report"
+        fi
         case "$BASELINE" in auto|cache|replay) ;; *) echo "::error::baseline must be auto, cache or replay, got '$BASELINE'"; exit 2 ;; esac
         case "$FAIL_ON" in none|high|any) ;; *) echo "::error::fail-on must be none, high or any, got '$FAIL_ON'"; exit 2 ;; esac
         case "$IMAGES" in changed|all|none) ;; *) echo "::error::images must be changed, all or none, got '$IMAGES'"; exit 2 ;; esac
+        case "$HEAD_NETWORK" in record|replay) ;; *) echo "::error::head-network must be record or replay, got '$HEAD_NETWORK'"; exit 2 ;; esac
 
         if [ ! -d .visual-diff ]; then
           echo "::error::no .visual-diff directory in $(pwd) — run \`vdiff init\` and commit it"
@@ -282,12 +382,18 @@ runs:
         eval "$command"
 
     # ---------------------------------------------------------------- the base side (D32)
+    # The recordings travel with the runs (D42): a baseline captured on the default branch recorded
+    # each flow's HAR, and a pull request that restores it replays the same traffic on both sides
+    # instead of recording afresh against a backend that may have drifted since. HARs are gitignored
+    # by design, so this cache is the only place CI can get one from.
     - name: Restore baseline runs
       id: baseline
       if: inputs.mode == 'pr' && inputs.baseline != 'replay'
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.working-directory }}/.visual-diff/runs
+        path: |
+          ${{ inputs.working-directory }}/.visual-diff/runs
+          ${{ inputs.working-directory }}/.visual-diff/flows/*.har
         key: vdiff-runs-${{ runner.os }}-${{ steps.resolve.outputs.spec_hash }}-${{ steps.resolve.outputs.base_sha }}
 
     - name: Replay the base revision
@@ -299,6 +405,10 @@ runs:
         BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
         BASELINE: ${{ inputs.baseline }}
         CLI: ${{ inputs.cli }}
+        # A first run records the flow's HAR and reads it back whole to scrub it; a large app's
+        # recording is hundreds of megabytes of JSON, more than Node's default heap. The runner has
+        # the memory; the process is told it may use it. Inherited by the dev server it spawns.
+        NODE_OPTIONS: --max-old-space-size=6144
       run: |
         set -euo pipefail
         cli=${CLI:-vdiff}
@@ -320,12 +430,34 @@ runs:
       env:
         FLOWS: ${{ steps.resolve.outputs.flows }}
         CLI: ${{ inputs.cli }}
+        HEAD_NETWORK: ${{ inputs.head-network }}
+        NODE_OPTIONS: --max-old-space-size=6144
       run: |
         set -euo pipefail
         cli=${CLI:-vdiff}
+        # The head records by default (D48): the base's recording — restored from the cache or made
+        # a step ago — has no answer for a request the pull request added, and a replay that aborts
+        # it fails the step for the wrong reason. `replay` is for a flow whose traffic is known not
+        # to change.
         for flow in $FLOWS; do
-          $cli run "$flow"
+          if [ "${HEAD_NETWORK:-record}" = "record" ]; then
+            $cli run "$flow" --record
+          else
+            $cli run "$flow"
+          fi
         done
+
+    # A replay that failed leaves its evidence — the failure screenshot, the DOM at the moment,
+    # server.log, install.log — in a run directory on a runner nobody can open. Keep it, so the reason
+    # a step failed is one download away rather than a re-run with more logging.
+    - name: Upload the runs when a replay failed
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}-runs
+        path: ${{ inputs.working-directory }}/.visual-diff/runs
+        if-no-files-found: ignore
+        retention-days: 7
 
     # In baseline mode that is the whole job: capture, cache, stop. Nothing is diffed, because there
     # is nothing yet to diff it against.
@@ -333,11 +465,79 @@ runs:
       if: inputs.mode == 'baseline'
       uses: actions/cache/save@v4
       with:
-        path: ${{ inputs.working-directory }}/.visual-diff/runs
+        path: |
+          ${{ inputs.working-directory }}/.visual-diff/runs
+          ${{ inputs.working-directory }}/.visual-diff/flows/*.har
         key: vdiff-runs-${{ runner.os }}-${{ steps.resolve.outputs.spec_hash }}-${{ github.sha }}
 
-    # ---------------------------------------------------------------- diff and export
-    - name: Diff and export
+    # ---------------------------------------------------------------- keyless review (D43)
+    #
+    # With a federation rule named and no key, the job's own GitHub identity is exchanged for a
+    # short-lived Anthropic token — once, here, because a GitHub OIDC token carries `jti` and can be
+    # exchanged exactly one time; a job reviewing three flows would otherwise fail on the second.
+    # The result is masked and handed to the review step as ANTHROPIC_AUTH_TOKEN. Needs
+    # `id-token: write` on the workflow, which the installed template documents.
+    - name: Mint an Anthropic token from the runner identity
+      id: oidc
+      if: inputs.mode == 'pr' && inputs.anthropic-federation-rule-id != '' && inputs.anthropic-api-key == ''
+      uses: actions/github-script@v7
+      env:
+        FEDERATION_RULE_ID: ${{ inputs.anthropic-federation-rule-id }}
+        ORGANIZATION_ID: ${{ inputs.anthropic-organization-id }}
+        SERVICE_ACCOUNT_ID: ${{ inputs.anthropic-service-account-id }}
+        WORKSPACE_ID: ${{ inputs.anthropic-workspace-id }}
+      with:
+        script: |
+          // The review is a paragraph a key buys; the evidence and the comment are what the job
+          // promises. So nothing in this step fails the job: a denied exchange is a warning, the
+          // token output stays empty, and the comment goes out with the numbers alone (D39, D43).
+          const { FEDERATION_RULE_ID, ORGANIZATION_ID, SERVICE_ACCOUNT_ID, WORKSPACE_ID } = process.env;
+          core.setOutput('token', '');
+          for (const [name, value] of Object.entries({ ORGANIZATION_ID, SERVICE_ACCOUNT_ID })) {
+            if (!value) {
+              core.warning(`anthropic-federation-rule-id is set but anthropic-${name.toLowerCase().replace('_', '-')} is empty; the review is skipped`);
+              return;
+            }
+          }
+          const assertion = await core.getIDToken('https://api.anthropic.com');
+          const body = {
+            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            assertion,
+            federation_rule_id: FEDERATION_RULE_ID,
+            organization_id: ORGANIZATION_ID,
+            service_account_id: SERVICE_ACCOUNT_ID,
+            ...(WORKSPACE_ID ? { workspace_id: WORKSPACE_ID } : {}),
+          };
+          const origin = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
+          const response = await fetch(`${origin}/v1/oauth/token`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            // The deny reason is deliberately opaque here; the Console's authentication history has it.
+            // The most common cause is the rule's subject: a job that runs in a GitHub Environment
+            // presents `repo:<owner>/<repo>:environment:<name>`, not the branch or pull_request form.
+            core.warning(`token exchange answered ${response.status}: ${text.slice(0, 300)} — the review is skipped. Check the rule's match against this run's sub claim (repo:${context.repo.owner}/${context.repo.repo}:…) in the Claude Console authentication history`);
+            return;
+          }
+          const token = JSON.parse(text).access_token;
+          if (!token) {
+            core.warning('token exchange answered without an access_token; the review is skipped');
+            return;
+          }
+          core.setSecret(token);
+          core.setOutput('token', token);
+          core.info(`minted a federated Anthropic token for the review (expires in ${JSON.parse(text).expires_in}s)`);
+
+    # ---------------------------------------------------------------- diff, review and export
+    #
+    # The review (D39) sits between the diff and the export so the bundle, the page and the comment
+    # all carry it. It is the only step that holds a model API key, and the key goes to `vdiff review`
+    # alone — the CLI still never sees the GitHub token (D29). A review that fails is a warning, not a
+    # failed job: the evidence is what CI mode promises, the paragraph is what a key buys.
+    - name: Diff, review and export
       id: export
       if: inputs.mode == 'pr'
       shell: bash
@@ -346,22 +546,114 @@ runs:
         FLOWS: ${{ steps.resolve.outputs.flows }}
         BUNDLE_ROOT: ${{ steps.resolve.outputs.bundle_root }}
         IMAGES: ${{ inputs.images }}
+        HTML: ${{ inputs.html }}
+        PUBLISH_BRANCH: ${{ inputs.publish-branch }}
         CLI: ${{ inputs.cli }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        # The federated bearer minted above (D43); empty when no rule was named or a key was.
+        ANTHROPIC_AUTH_TOKEN: ${{ steps.oidc.outputs.token }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        REVIEW_MODEL: ${{ inputs.review-model }}
+        # What the model judges the change against: without it, "unrelated" cannot be told from
+        # "intended", and the review says so.
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
       run: |
         set -euo pipefail
         cli=${CLI:-vdiff}
+        reviewed=false
+
+        context_file=''
+        if [ -n "${PR_TITLE}${PR_BODY}" ]; then
+          context_file="${RUNNER_TEMP}/vdiff-pr-context.md"
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$context_file"
+        fi
+
         for flow in $FLOWS; do
           # `diff` first so its human output lands in the log: a reader scanning the job should see
           # the finding table without downloading anything.
           $cli diff "$flow"
-          $cli export "$flow" --images "$IMAGES" --out "$BUNDLE_ROOT/$flow"
+
+          if [ -n "${ANTHROPIC_API_KEY}${ANTHROPIC_AUTH_TOKEN}${OPENAI_API_KEY}" ]; then
+            args=(review "$flow")
+            if [ -n "$REVIEW_MODEL" ]; then args+=(--model "$REVIEW_MODEL"); fi
+            if [ -n "$context_file" ]; then args+=(--context "$context_file"); fi
+            if $cli "${args[@]}"; then
+              reviewed=true
+            else
+              echo "::warning::vdiff review failed for flow '$flow' (exit $?); the comment will carry the numbers without a review"
+            fi
+          fi
+
+          # `--html` is only passed when it deviates from the default, so a user-pinned `cli:` older
+          # than the flag keeps working until they opt in.
+          # The picture of the report (D51) is taken only when there is somewhere to publish it: without
+          # `publish-branch` the comment cannot show an image at all (D31), and a Chromium launch for
+          # a file nobody will see is a minute of the job. Same courtesy to an older pinned `cli:`.
+          preview=""
+          if [ -n "$PUBLISH_BRANCH" ]; then preview="--preview"; fi
+          if [ "${HTML:-linked}" = "linked" ]; then
+            $cli export "$flow" --images "$IMAGES" --out "$BUNDLE_ROOT/$flow" $preview
+          else
+            $cli export "$flow" --images "$IMAGES" --html "$HTML" --out "$BUNDLE_ROOT/$flow" $preview
+          fi
         done
+        echo "reviewed=$reviewed" >> "$GITHUB_OUTPUT"
 
     # ---------------------------------------------------------------- publish images (D31)
     #
     # Only when a branch was nominated. Pushing images into someone's repository on every pull request
     # is not a default anybody should get by surprise, so the artifact is the default and this is the
     # opt-in that makes inline images possible at all.
+    # Where Pages serves the publish branch, asked rather than configured (D52): a private site on
+    # Enterprise Cloud has a random subdomain nobody should have to copy into a workflow, and a
+    # public one is derivable but easy to get wrong. The site is used only when it deploys from the
+    # publish branch; anything else — no site, a site on another branch, a token without
+    # `pages: read` — leaves the comment without a report link, and says why in the log.
+    - name: Find the Pages site
+      id: pages
+      if: inputs.mode == 'pr' && inputs.publish-branch != '' && inputs.pages-url == ''
+      uses: actions/github-script@v7
+      env:
+        BRANCH: ${{ inputs.publish-branch }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          core.setOutput('url', '');
+          const { owner, repo } = context.repo;
+          let site;
+          try {
+            ({ data: site } = await github.rest.repos.getPages({ owner, repo }));
+          } catch (error) {
+            if (error.status === 404) {
+              core.info('no GitHub Pages site on this repository; the comment links the artifact instead of a report page (set pages-url, or enable Pages from the publish branch)');
+            } else if (error.status === 403) {
+              core.warning('the token may not read the Pages site (grant the workflow `pages: read`, or set pages-url); the comment links the artifact instead of a report page');
+            } else {
+              core.warning(`Pages lookup answered ${error.status ?? ''} ${error.message}; the comment links the artifact instead of a report page`);
+            }
+            return;
+          }
+          if (site.build_type !== 'legacy' || site.source?.branch !== process.env.BRANCH) {
+            core.warning(`the Pages site deploys from ${site.build_type === 'legacy' ? `branch ${site.source?.branch}` : 'a workflow'}, not from ${process.env.BRANCH}; point it at the publish branch (Settings → Pages → Deploy from a branch) or set pages-url`);
+            return;
+          }
+          const url = String(site.html_url ?? '').replace(/\/+$/, '');
+          core.setOutput('url', url);
+          core.info(`Pages serves ${process.env.BRANCH} at ${url}${site.public === false ? ' (private)' : ''}`);
+
+    # The comment is signed by whoever holds the token. A GitHub App gives the pull request a
+    # comment from "Visual Diff" with its mark, rather than one from github-actions or from the
+    # person whose token the workflow happened to use (D49). The installation token is minted
+    # here, scoped to this repository, and used by the comment step alone.
+    - name: Sign in as the Visual Diff app
+      id: app
+      if: inputs.mode == 'pr' && inputs.app-id != ''
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+
     - name: Publish diff images
       id: publish
       if: inputs.mode == 'pr' && inputs.publish-branch != ''
@@ -371,19 +663,28 @@ runs:
         FLOWS: ${{ steps.resolve.outputs.flows }}
         BRANCH: ${{ inputs.publish-branch }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        # The workflow's own token, not the app's: pushing the branch is the workflow's `contents:
+        # write`, and the app then needs no repository permission beyond pull requests (D49).
         GH_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ github.repository }}
         SERVER: ${{ github.server_url }}
         SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        PAGES_URL: ${{ inputs.pages-url || steps.pages.outputs.url }}
       run: |
         set -euo pipefail
-        prefix="pr-${PR_NUMBER:-manual}/${SHA:0:12}"
+        # `vdiff` sits between the pull request and the commit so the branch can hold other things
+        # under the same pull request without colliding, and so a Pages URL reads as ours:
+        #   <pages-url>/pr-13/vdiff/4f9c2a1b7e3d/checkout/report.html
+        prefix="pr-${PR_NUMBER:-manual}/vdiff/${SHA:0:12}"
         work="${RUNNER_TEMP}/vdiff-publish"
         rm -rf "$work"
-        git clone --depth 1 --branch "$BRANCH" \
-          "${SERVER}/${REPO}.git" "$work" 2>/dev/null || {
+        # The token rides on the clone as well as the push: a private repository answers an
+        # anonymous clone with a username prompt, which is exit 128 on a runner. The runner masks
+        # the token in the log.
+        remote="https://x-access-token:${GH_TOKEN}@${SERVER#https://}/${REPO}.git"
+        git clone --depth 1 --branch "$BRANCH" "$remote" "$work" 2>/dev/null || {
           # First publish: an orphan branch, so the image history never touches the code history.
-          git clone --depth 1 "${SERVER}/${REPO}.git" "$work"
+          git clone --depth 1 "$remote" "$work"
           git -C "$work" checkout --orphan "$BRANCH"
           git -C "$work" rm -rf . >/dev/null 2>&1 || true
           printf '%s\n' \
@@ -399,6 +700,7 @@ runs:
             cp -R "$BUNDLE_ROOT/$flow/images" "$target/"
           fi
           cp "$BUNDLE_ROOT/$flow/report.html" "$target/" 2>/dev/null || true
+          cp "$BUNDLE_ROOT/$flow/report.inline.html" "$target/" 2>/dev/null || true
         done
 
         cd "$work"
@@ -409,9 +711,23 @@ runs:
           echo "nothing new to publish"
         else
           git commit -m "visual-diff: ${prefix}"
-          git push "https://x-access-token:${GH_TOKEN}@${SERVER#https://}/${REPO}.git" "HEAD:${BRANCH}"
+          git push "$remote" "HEAD:${BRANCH}"
         fi
-        echo "image_base=https://raw.githubusercontent.com/${REPO}/${BRANCH}/${prefix}" >> "$GITHUB_OUTPUT"
+        # The same files as a *site* (D40): raw.githubusercontent.com serves report.html as text, so
+        # the page needs Pages in front of the branch. The user names that URL; this derives the
+        # per-pull-request prefix under it. Pages deploys a pushed branch in about a minute, so the
+        # link may 404 briefly after the first push of a new prefix.
+        #
+        if [ -n "$PAGES_URL" ]; then
+          echo "report_base=${PAGES_URL%/}/${prefix}" >> "$GITHUB_OUTPUT"
+        fi
+        # The comment's images are addressed through github.com itself (D50, amended):
+        # <server>/<repo>/raw/<branch>/<path>. GitHub leaves that form alone when it renders the
+        # comment, so the reader's own signed-in browser fetches it and GitHub signs the file for a
+        # private repository. Every other host — raw.githubusercontent.com, a Pages site — is
+        # rewritten to the camo proxy, which fetches anonymously and is turned away by anything
+        # private; on a public repository the github.com form simply redirects to raw.
+        echo "image_base=${SERVER}/${REPO}/raw/${BRANCH}/${prefix}" >> "$GITHUB_OUTPUT"
 
     # ---------------------------------------------------------------- artifact, then comment
     #
@@ -436,6 +752,7 @@ runs:
         FLOWS: ${{ steps.resolve.outputs.flows }}
         BUNDLE_ROOT: ${{ steps.resolve.outputs.bundle_root }}
         IMAGE_BASE: ${{ steps.publish.outputs.image_base }}
+        REPORT_BASE: ${{ steps.publish.outputs.report_base }}
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         ARTIFACT_NAME: ${{ inputs.artifact-name }}
         FAIL_ON: ${{ inputs.fail-on }}
@@ -448,12 +765,20 @@ runs:
         changed=0
         gate=ok
         first=''
+        report_url=''
 
         for flow in $FLOWS; do
           args=(comment "$flow" --json --fail-on "$FAIL_ON" --artifact-name "$ARTIFACT_NAME"
                 --out "$BUNDLE_ROOT/$flow/comment.md")
-          if [ -n "$IMAGE_BASE" ]; then args+=(--image-base "$IMAGE_BASE/$flow"); fi
+          # The picture of the report (D51) rides with the step images: same publish target, same
+          # rule — no image base, no pictures. `--bundle` is where `vdiff comment` looks for it.
+          if [ -n "$IMAGE_BASE" ]; then args+=(--image-base "$IMAGE_BASE/$flow" --bundle "$BUNDLE_ROOT/$flow"); fi
           if [ -n "$ARTIFACT_URL" ]; then args+=(--artifact-url "$ARTIFACT_URL"); fi
+          # The hosted page (D40): the comment's call to action, rendered with the verdict.
+          if [ -n "$REPORT_BASE" ]; then
+            args+=(--report-url "$REPORT_BASE/$flow/report.html")
+            if [ -z "$report_url" ]; then report_url="$REPORT_BASE/$flow/report.html"; fi
+          fi
 
           # `--fail-on` exits 3 when it trips (D30). The verdict is collected here and enforced in
           # the last step of the job, after the comment has been posted (D35).
@@ -497,17 +822,20 @@ runs:
         echo "changed_steps=$changed" >> "$GITHUB_OUTPUT"
         echo "gate=$gate" >> "$GITHUB_OUTPUT"
         echo "comment_file=$first" >> "$GITHUB_OUTPUT"
+        echo "report_url=$report_url" >> "$GITHUB_OUTPUT"
 
-    # One comment per flow, found by its marker and updated in place, so a pull request with fourteen
-    # pushes has one visual-diff comment per flow rather than fourteen (D33).
+    # Unchanged flows share a small summary. Changed or incomplete flows keep their own reports.
     - name: Post the comment
       if: inputs.mode == 'pr' && inputs.comment == 'true' && github.event.pull_request.number
       uses: actions/github-script@v7
       env:
         FLOWS: ${{ steps.resolve.outputs.flows }}
         BUNDLE_ROOT: ${{ steps.resolve.outputs.bundle_root }}
+        # The app's login, `<slug>[bot]`, when the comment is signed by one (D49). Empty otherwise.
+        APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        REPORT_BASE: ${{ steps.publish.outputs.report_base }}
       with:
-        github-token: ${{ inputs.github-token }}
+        github-token: ${{ steps.app.outputs.token || inputs.github-token }}
         script: |
           const fs = require('node:fs');
           const path = require('node:path');
@@ -518,7 +846,10 @@ runs:
             owner, repo, issue_number, per_page: 100,
           });
 
-          for (const flow of process.env.FLOWS.trim().split(/\s+/).filter(Boolean)) {
+          const flows = process.env.FLOWS.trim().split(/\s+/).filter(Boolean);
+          const unchanged = [];
+          const reports = [];
+          for (const flow of flows) {
             const file = path.join(process.env.BUNDLE_ROOT, flow, 'comment.md');
             if (!fs.existsSync(file)) {
               core.warning(`no rendered comment for flow ${flow}`);
@@ -531,13 +862,49 @@ runs:
               core.warning(`comment for ${flow} carries no marker; posting without upsert`);
             }
 
-            const previous = existing.find((comment) => comment.body?.includes(marker));
-            if (previous) {
+            const json = path.join(process.env.BUNDLE_ROOT, flow, 'comment.json');
+            const quiet = fs.existsSync(json) &&
+              JSON.parse(fs.readFileSync(json, 'utf8')).data?.unchanged === true;
+            (quiet ? unchanged : reports).push({ flow, marker, body });
+          }
+
+          // Key by the selected flows so independent action jobs do not overwrite each other.
+          const summaryMarker = `<!-- vdiff:unchanged-flows:${[...flows].sort().join(',')} -->`;
+          if (unchanged.length > 0) {
+            const base = process.env.REPORT_BASE?.replace(/\/+$/, '');
+            const names = unchanged.map(({ flow }) =>
+              base ? `[${flow}](${base}/${flow}/report.html)` : `\`${flow}\``);
+            const body = `${summaryMarker}\n**Visual Diff:** No visual changes above configured thresholds ` +
+              `in ${unchanged.length} flow${unchanged.length === 1 ? '' : 's'}: ${names.join(', ')}.\n`;
+            reports.push({ flow: 'unchanged flows', marker: summaryMarker, body });
+          }
+
+          for (const { flow, marker, body } of reports) {
+            const previous = existing.find((comment) => comment.body?.split('\n', 1)[0].trim() === marker);
+            // An edit keeps the original author. When the comment is signed by an app (D49) and the
+            // one on the thread was posted by someone else — github-actions, or a person, from before
+            // the app was set up — it is replaced, once, so the thread shows the app's name and mark.
+            const appLogin = process.env.APP_SLUG ? `${process.env.APP_SLUG}[bot]` : '';
+            if (previous && appLogin && previous.user?.login !== appLogin) {
+              await github.rest.issues.deleteComment({ owner, repo, comment_id: previous.id });
+              core.info(`replaced comment ${previous.id} by ${previous.user?.login} for flow ${flow}: now signed by ${appLogin}`);
+              const created = await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info(`created comment ${created.data.id} for flow ${flow}`);
+            } else if (previous) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
               core.info(`updated comment ${previous.id} for flow ${flow}`);
             } else {
               const created = await github.rest.issues.createComment({ owner, repo, issue_number, body });
               core.info(`created comment ${created.data.id} for flow ${flow}`);
+            }
+          }
+
+          // Remove obsolete reports only after the replacement comments have been published.
+          const obsolete = new Set(unchanged.map(({ marker }) => marker));
+          if (unchanged.length === 0) obsolete.add(summaryMarker);
+          for (const comment of existing) {
+            if (obsolete.has(comment.body?.split('\n', 1)[0].trim())) {
+              await github.rest.issues.deleteComment({ owner, repo, comment_id: comment.id });
             }
           }
 

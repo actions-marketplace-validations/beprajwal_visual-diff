@@ -10,7 +10,7 @@
  *  - human mode putting the markdown alone on stdout, so `vdiff comment flow > body.md` works.
  */
 
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,7 +18,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { EXIT, type DiffResult } from '../../types.js';
 import type { CommandContext } from '../command.js';
-import { createTestPorts, createTestStore, fakeDiffResult, fakeRunSummary } from '../testing.js';
+import { significanceFingerprint } from '../../diff/significance.js';
+import { minorDiff } from '../../diff/tolerance-testkit.js';
+import { commentFingerprint } from '../../ci/review-triage.js';
+import { makeStepDiff, makeViewportDiff, makeFinding } from '../../report/ui/test-fixtures.js';
+import {
+  createTestPorts,
+  createTestStore,
+  fakeConfig,
+  fakeDiffResult,
+  fakeRunSummary,
+  fakeReview,
+} from '../testing.js';
 import { comment } from './comment.js';
 import { exportCommand } from './export.js';
 
@@ -85,6 +96,39 @@ const invocation = {
 };
 
 describe('vdiff comment', () => {
+  it('keeps exit 3 and raw JSON evidence after AI filtering, and rejects a preview when its review disappears', async () => {
+    const cwd = await tempDir();
+    const raw = diffWith(1);
+    raw.steps = [makeStepDiff('noise', 'matched', { viewports: {
+      '1280x800': makeViewportDiff('1280x800', { pixelChangedRatio: .02,
+        findings: [makeFinding('f1', { step: 'noise', changes: [], reasons: ['pixels-only'] })] }),
+    } })];
+    const ctx = context(raw, cwd);
+    const store = await ctx.ports.openStore(fakeConfig());
+    const pair = { flow: raw.flow, ...raw.pair };
+    const assessment = { assessment: 'capture-noise' as const, confidence: 'high' as const, reason: 'Only a blinking caret differs.' };
+    const review = fakeReview({ diffFingerprint: significanceFingerprint(raw), changes: [], triage: { version: 1,
+      comparedCells: [{ step: 'noise', viewport: '1280x800' }], findings: [{ findingId: 'f1', ...assessment }],
+      viewports: [{ step: 'noise', viewport: '1280x800', ...assessment }] } });
+    await store.writeReview(pair, review);
+    await mkdir(join(cwd, 'images'));
+    await writeFile(join(cwd, 'images', 'preview.png'), 'fake-image');
+    await writeFile(join(cwd, 'images', 'preview.json'), JSON.stringify({ diffFingerprint: commentFingerprint(raw, review) }));
+    const args = { ...invocation, failOn: 'any' as const, imageBase: 'https://images.test', bundle: cwd };
+    const filtered = await comment(ctx, args);
+    expect(filtered.exitCode).toBe(EXIT.GATE_FAILED);
+    expect(filtered.data.result).toEqual(raw);
+    expect(filtered.data.unchanged).toBe(false);
+    expect(filtered.data.markdown).toContain('AI classified');
+    expect(filtered.data.markdown).not.toContain('2.0%');
+    expect(filtered.data.preview).toBe(true);
+    await store.invalidateReview(pair);
+    const restored = await comment(ctx, args);
+    expect(restored.exitCode).toBe(EXIT.GATE_FAILED);
+    expect(restored.data.preview).toBe(false);
+    expect(restored.data.markdown).toContain('2.0%');
+  });
+
   it('puts the markdown alone on stdout and exits 0', async () => {
     const result = await comment(context(diffWith(2)), invocation);
     expect(result.exitCode ?? EXIT.OK).toBe(EXIT.OK);
@@ -143,6 +187,36 @@ describe('vdiff comment', () => {
     expect(high.data.markdown).toContain('❌ **Gate failed**');
   });
 
+  it('says a gate cannot trip when the project turned findings off (D54)', async () => {
+    const suppressed = diffWith(0);
+    suppressed.emit = { findings: false, warnings: true };
+    const config = fakeConfig();
+    config.diff.findings = false;
+    const ctx: CommandContext = {
+      ...context(suppressed),
+      ports: createTestPorts({
+        loadConfig: async () => config,
+        openStore: async () =>
+          createTestStore({
+            runs: {
+              checkout: [fakeRunSummary({ runId: '0003' }), fakeRunSummary({ runId: '0007' })],
+            },
+            diffs: { 'checkout/0003..0007': suppressed },
+          }),
+      }),
+    };
+
+    const result = await comment(ctx, { ...invocation, failOn: 'high' });
+    expect(result.exitCode ?? EXIT.OK).toBe(EXIT.OK);
+    expect(result.warnings).toContain(
+      '--fail-on high cannot trip: findings are off for this diff, so the gate has nothing to count',
+    );
+
+    // Nothing of the sort when no gate was asked for: `none` gates nothing either way.
+    const ungated = await comment(ctx, invocation);
+    expect((ungated.warnings ?? []).some((w) => w.includes('cannot trip'))).toBe(false);
+  });
+
   it('does not trip a gate the findings do not reach', async () => {
     const result = await comment(context(diffWith(4, 0)), { ...invocation, failOn: 'high' });
     expect(result.exitCode ?? EXIT.OK).toBe(EXIT.OK);
@@ -155,10 +229,112 @@ describe('vdiff comment', () => {
     expect(result.warnings?.join(' ')).toContain('no --image-base given');
   });
 
-  it('carries the caps through to the renderer and reports what was dropped', async () => {
-    const result = await comment(context(diffWith(2)), { ...invocation, maxFindings: 0 });
-    expect(result.data.truncated.findings).toBe(0);
+  it('opens with the picture of the report only when the bundle holds it (D51)', async () => {
+    const dir = await tempDir();
+    // No bundle named: no picture, whatever the image base.
+    const bare = await comment(context(diffWith(2), dir), {
+      ...invocation,
+      imageBase: 'https://example.test/base',
+    });
+    expect(bare.data.preview).toBe(false);
+    expect(bare.data.markdown).not.toContain('preview.png');
+
+    // A bundle without the captures: still no picture — the files are checked, not assumed.
+    await mkdir(join(dir, 'bundle', 'images'), { recursive: true });
+    const empty = await comment(context(diffWith(2), dir), {
+      ...invocation,
+      imageBase: 'https://example.test/base',
+      bundle: 'bundle',
+    });
+    expect(empty.data.preview).toBe(false);
+
+    // The light capture alone: a plain <img>, no dark source.
+    await writeFile(join(dir, 'bundle', 'images', 'preview.png'), 'png');
+    await writeFile(join(dir, 'bundle', 'images', 'preview.json'), JSON.stringify({
+      diffFingerprint: significanceFingerprint(diffWith(2)),
+    }));
+    const light = await comment(context(diffWith(2), dir), {
+      ...invocation,
+      imageBase: 'https://example.test/base',
+      bundle: 'bundle',
+    });
+    expect(light.data.preview).toBe(true);
+    expect(light.data.markdown).toContain('<img src="https://example.test/base/images/preview.png"');
+    expect(light.data.markdown).not.toContain('prefers-color-scheme');
+
+    // Both captures: the dark one rides as a <source>.
+    await writeFile(join(dir, 'bundle', 'images', 'preview-dark.png'), 'png');
+    const both = await comment(context(diffWith(2), dir), {
+      ...invocation,
+      imageBase: 'https://example.test/base',
+      bundle: 'bundle',
+    });
+    expect(both.data.markdown).toContain(
+      '<source media="(prefers-color-scheme: dark)" srcset="https://example.test/base/images/preview-dark.png">',
+    );
+
+    // Without an image base the bundle is not even consulted (D31).
+    const noBase = await comment(context(diffWith(2), dir), { ...invocation, bundle: 'bundle' });
+    expect(noBase.data.preview).toBe(false);
+  });
+
+  it('carries the renderer verdicts through to the JSON payload', async () => {
+    const result = await comment(context(diffWith(2)), {
+      ...invocation,
+      imageBase: 'https://example.test/base',
+      maxImages: 0,
+    });
+    expect(result.data.truncated).toEqual({ images: 0, steps: false });
     expect(result.data.bytes).toBeGreaterThan(0);
+  });
+
+  it('omits even a current preview from an unchanged result and reports that in JSON', async () => {
+    const dir = await tempDir();
+    const raw = minorDiff();
+    const diff = fakeDiffResult({ steps: raw.steps, summary: raw.summary });
+    const fingerprint = significanceFingerprint(diff);
+    await mkdir(join(dir, 'bundle', 'images'), { recursive: true });
+    await writeFile(join(dir, 'bundle', 'images', 'preview.png'), 'png');
+    await writeFile(join(dir, 'bundle', 'images', 'preview.json'), JSON.stringify({
+      diffFingerprint: fingerprint,
+    }));
+    const ctx = context(diff, dir);
+    const render = ctx.ports.renderComment;
+    let forwarded: string | undefined;
+    ctx.ports.renderComment = async (input) => {
+      forwarded = input.previewDiffFingerprint;
+      return render(input);
+    };
+    const result = await comment(ctx, {
+      ...invocation, bundle: 'bundle', imageBase: 'https://example.test/base',
+    });
+    expect(forwarded).toBe(fingerprint);
+    expect(result.data.unchanged).toBe(true);
+    expect(result.data.preview).toBe(false);
+    expect(result.data.markdown).not.toContain('https://example.test/base/images/preview.png');
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['malformed', '{'],
+    ['null', 'null'],
+    ['wrong shape', JSON.stringify({ diffFingerprint: 7 })],
+    ['empty', JSON.stringify({ diffFingerprint: '' })],
+    ['stale', JSON.stringify({ diffFingerprint: 'b'.repeat(64) })],
+  ])('omits a tolerant diff preview when its capture stamp is %s', async (_label, manifest) => {
+    const dir = await tempDir();
+    const raw = minorDiff();
+    const diff = fakeDiffResult({ steps: raw.steps, summary: raw.summary });
+    await mkdir(join(dir, 'bundle', 'images'), { recursive: true });
+    await writeFile(join(dir, 'bundle', 'images', 'preview.png'), 'png');
+    if (manifest !== undefined) {
+      await writeFile(join(dir, 'bundle', 'images', 'preview.json'), manifest);
+    }
+    const result = await comment(context(diff, dir), {
+      ...invocation, bundle: 'bundle', imageBase: 'https://example.test/base',
+    });
+    expect(result.data.preview).toBe(false);
+    expect(result.data.markdown).not.toContain('preview.png');
   });
 });
 
@@ -169,6 +345,8 @@ describe('vdiff export', () => {
     e2e: false,
     failOn: 'none' as const,
     images: 'changed' as const,
+    html: 'linked' as const,
+    preview: false,
     json: false,
   };
 
@@ -187,6 +365,42 @@ describe('vdiff export', () => {
     ]);
     expect(result.data.files).toContain('summary.json');
     expect(result.data.comment.path).toBe(join(dir, 'bundle', 'comment.md'));
+  });
+
+  it('asks the preview port for the captures under --preview and lists them (D51)', async () => {
+    const dir = await tempDir();
+    const asked: string[] = [];
+    const ctx = context(diffWith(1), dir);
+    ctx.ports.capturePreview = async (request) => {
+      asked.push(request.outDir);
+      return { files: ['images/preview.png', 'images/preview-dark.png'] };
+    };
+    const result = await exportCommand(ctx, { ...exportInvocation, out: 'bundle', preview: true });
+    expect(asked).toEqual([join(dir, 'bundle')]);
+    expect(result.data.preview).toEqual(['images/preview.png', 'images/preview-dark.png']);
+    // The card the picture is taken of was written first, into the bundle.
+    expect(result.data.files).toContain('preview.html');
+    const card = await readFile(join(dir, 'bundle', 'preview.html'), 'utf8');
+    expect(card).toContain('class="preview-card"');
+
+    // Nothing is written or photographed unless asked.
+    const quiet = await exportCommand(ctx, { ...exportInvocation, out: 'other' });
+    expect(asked).toHaveLength(1);
+    expect(quiet.data.preview).toEqual([]);
+    expect(quiet.data.files).not.toContain('preview.html');
+  });
+
+  it('exports without a picture, and says so, when no browser can be launched', async () => {
+    const dir = await tempDir();
+    const ctx = context(diffWith(1), dir);
+    ctx.ports.capturePreview = async () => {
+      throw new Error("Chromium is not installed; run `vdiff install-browser`");
+    };
+    const result = await exportCommand(ctx, { ...exportInvocation, out: 'bundle', preview: true });
+    expect(result.exitCode).toBe(EXIT.OK);
+    expect(result.data.preview).toEqual([]);
+    expect(result.warnings?.join(' ')).toContain('no preview captured: Chromium is not installed');
+    expect((await readdir(join(dir, 'bundle'))).sort()).toContain('report.html');
   });
 
   it('defaults the bundle directory to the store, per pair', async () => {
@@ -210,10 +424,11 @@ describe('vdiff export', () => {
             missing: [],
             comment: {
               markdown: '',
+              unchanged: false,
               marker: '<!-- vdiff:checkout:pr -->',
               bytes: 0,
               images: 0,
-              truncated: { findings: 0, images: 0, steps: false },
+              truncated: { images: 0, steps: false },
             },
           };
         },

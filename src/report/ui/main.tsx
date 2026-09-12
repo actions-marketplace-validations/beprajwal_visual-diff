@@ -27,7 +27,7 @@ import {
   viewportsOf,
   visibleCells,
 } from './derive.js';
-import { KEY_BINDINGS, resolveKey } from './keys.js';
+import { KEY_BINDINGS, resolveKey, type KeyActionType } from './keys.js';
 import { formatHash, parseHash } from './route.js';
 import { pairId, screenshotPath } from './paths.js';
 import {
@@ -172,12 +172,12 @@ export function App({ client }: AppProps) {
   /* ------------------------------------------------------------ derived view model */
 
   const cells = useMemo(
-    () => (state.diff ? buildFilmstrip(state.diff, state.viewport) : []),
-    [state.diff, state.viewport],
+    () => (state.diff ? buildFilmstrip(state.diff, state.viewport, state.showMinorChanges) : []),
+    [state.diff, state.viewport, state.showMinorChanges],
   );
   const strip = useMemo(
-    () => visibleCells(cells, state.findingsOnly),
-    [cells, state.findingsOnly],
+    () => visibleCells(cells, state.findingsOnly, state.showMinorChanges),
+    [cells, state.findingsOnly, state.showMinorChanges],
   );
   const cell = useMemo(() => cells.find((c) => c.id === state.step), [cells, state.step]);
   const stepDiff = useMemo(
@@ -186,9 +186,12 @@ export function App({ client }: AppProps) {
   );
   const viewportDiff = viewportDiffOf(stepDiff, state.viewport);
   const findings = useMemo(
-    () => findingsForStep(stepDiff, state.viewport),
-    [stepDiff, state.viewport],
+    () => findingsForStep(stepDiff, state.viewport, state.showMinorChanges),
+    [stepDiff, state.viewport, state.showMinorChanges],
   );
+  const hiddenFindings = state.showMinorChanges
+    ? 0
+    : findingsForStep(stepDiff, state.viewport).length - findings.length;
   const viewports = useMemo(() => (state.diff ? viewportsOf(state.diff) : []), [state.diff]);
   const baseAttribution = useMemo(
     () => attributionForRun(state, state.base),
@@ -209,10 +212,10 @@ export function App({ client }: AppProps) {
   const viewportCounts = useMemo(() => {
     const counts: Record<ViewportId, number> = {};
     for (const viewport of viewports) {
-      counts[viewport] = findingsForStep(stepDiff, viewport).length;
+      counts[viewport] = findingsForStep(stepDiff, viewport, state.showMinorChanges).length;
     }
     return counts;
-  }, [viewports, stepDiff]);
+  }, [viewports, stepDiff, state.showMinorChanges]);
 
   const shotUrl = useCallback(
     (side: 'base' | 'head', step: string | null): string | null => {
@@ -326,6 +329,37 @@ export function App({ client }: AppProps) {
 
   /* ------------------------------------------------------------ keyboard (§9) */
 
+  // One table of actions, reached two ways: a key press, or a click on the same entry in the
+  // legend. A reviewer on a touch device, or one who never reads shortcut hints, gets every
+  // binding as a button; the legend stops being documentation and becomes the control.
+  const performKeyAction = useCallback((action: KeyActionType): void => {
+    switch (action) {
+      case 'step-next':
+        dispatch({ type: 'step-next' });
+        break;
+      case 'step-prev':
+        dispatch({ type: 'step-prev' });
+        break;
+      case 'run-older':
+        dispatch({ type: 'run-older' });
+        break;
+      case 'run-newer':
+        dispatch({ type: 'run-newer' });
+        break;
+      case 'toggle-overlay':
+        dispatch({ type: 'toggle-overlay' });
+        break;
+      case 'toggle-findings-only':
+        dispatch({ type: 'toggle-findings-only' });
+        break;
+      case 'dismiss':
+        dispatch({ type: 'dismiss' });
+        break;
+      default:
+        break;
+    }
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       const action = resolveKey({
@@ -338,35 +372,18 @@ export function App({ client }: AppProps) {
       });
       if (!action) return;
       event.preventDefault();
-      switch (action) {
-        case 'step-next':
-          dispatch({ type: 'step-next' });
-          break;
-        case 'step-prev':
-          dispatch({ type: 'step-prev' });
-          break;
-        case 'run-older':
-          dispatch({ type: 'run-older' });
-          break;
-        case 'run-newer':
-          dispatch({ type: 'run-newer' });
-          break;
-        case 'toggle-overlay':
-          dispatch({ type: 'toggle-overlay' });
-          break;
-        case 'toggle-findings-only':
-          dispatch({ type: 'toggle-findings-only' });
-          break;
-        case 'dismiss':
-          dispatch({ type: 'dismiss' });
-          break;
-        default:
-          break;
-      }
+      performKeyAction(action);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [performKeyAction]);
+
+  /** Whether a legend toggle is currently on, so its button reads as pressed. */
+  const legendPressed = (action: KeyActionType): boolean | undefined => {
+    if (action === 'toggle-overlay') return state.view === 'overlay';
+    if (action === 'toggle-findings-only') return state.findingsOnly;
+    return undefined;
+  };
 
   /* ------------------------------------------------------------ render */
 
@@ -402,14 +419,32 @@ export function App({ client }: AppProps) {
             >
               findings only
             </button>
+            <button
+              type="button"
+              aria-pressed={state.showMinorChanges}
+              title="include changes within the configured tolerances"
+              onClick={() => dispatch({ type: 'toggle-minor-changes' })}
+            >
+              show minor changes
+            </button>
             <span class="spacer" />
             {state.loadingDiff ? <span class="note">computing…</span> : null}
-            <span class="legend">
-              {KEY_BINDINGS.map((binding) => (
-                <span key={binding.key}>
-                  <kbd>{binding.label}</kbd> {binding.description}
-                </span>
-              ))}
+            <span class="legend" role="group" aria-label="actions, also available as keyboard shortcuts">
+              {KEY_BINDINGS.map((binding) => {
+                const pressed = legendPressed(binding.action);
+                return (
+                  <button
+                    type="button"
+                    key={binding.key}
+                    class="legend-action"
+                    title={`${binding.description} — key ${binding.label}`}
+                    {...(pressed === undefined ? {} : { 'aria-pressed': pressed })}
+                    onClick={() => performKeyAction(binding.action)}
+                  >
+                    <kbd>{binding.label}</kbd> {binding.description}
+                  </button>
+                );
+              })}
             </span>
           </div>
 
@@ -447,7 +482,13 @@ export function App({ client }: AppProps) {
             </div>
           ) : null}
 
-          {state.diff ? (
+          {state.diff && cells.length > 0 && strip.length === 0 ? (
+            <div class="stage">
+              <p class="notice">
+                All steps are within tolerance. Enable “show minor changes” to inspect them.
+              </p>
+            </div>
+          ) : state.diff ? (
             <FocusPane
               cell={cell}
               viewportDiff={viewportDiff}
@@ -482,6 +523,7 @@ export function App({ client }: AppProps) {
           />
           <RightRail
             findings={findings}
+            hiddenFindings={hiddenFindings}
             selectedFinding={state.selectedFinding}
             unavailable={degradedLayerNotes(state.diff)}
             cropUrl={cropUrl}

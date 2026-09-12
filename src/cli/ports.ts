@@ -25,6 +25,7 @@ import type {
   FeedbackEntry,
   FlowSpec,
   PairRef,
+  Review,
   RunId,
   RunOptions,
   RunResult,
@@ -49,6 +50,10 @@ import type {
   CommentInput,
   ExportReport,
   ExportRequest,
+  ReviewRequest,
+  ReviewResponse,
+  PreviewReport,
+  PreviewRequest,
 } from '../ci/index.js';
 import type { E2eOrigin, E2eSourceFormat } from './e2e.js';
 import type { VariantName, VariantSpec } from './variant.js';
@@ -137,6 +142,15 @@ export interface StorePort {
   readDiff(pair: PairRef): Promise<DiffResult | null>;
   /** Persists `findings.json` (plus crops) and returns its absolute path. */
   writeDiff(pair: PairRef, result: DiffResult): Promise<string>;
+  /**
+   * `review.json` for the pair (CI spec D39) — a model's reading of the stored diff — or null when
+   * none was written, or the one on disk read a `findings.json` from another engine version.
+   */
+  readReview(pair: PairRef, engineVersion?: string): Promise<Review | null>;
+  /** Persists `review.json` beside the pair's `findings.json`; returns its absolute path. */
+  writeReview(pair: PairRef, review: Review): Promise<string>;
+  /** Removes an earlier review before retrying, so a failed attempt cannot reuse its decisions. */
+  invalidateReview(pair: PairRef): Promise<void>;
   /** Exempts a run from retention pruning (spec §6). */
   pinRun(flow: string, runId: RunId): Promise<RunSummary>;
   /** Deletes a run's blobs, keeping meta.json and flow.snapshot.yaml (spec §6). */
@@ -320,6 +334,18 @@ export interface Ports {
   renderComment(input: CommentInput): Promise<CommentDocument>;
   /** `ci/index.ts#exportBundle` — the portable evidence bundle (CI spec §5). */
   exportBundle(request: ExportRequest): Promise<ExportReport>;
+  /**
+   * `ci/index.ts#capturePreview` — photograph the bundle's own report page for the comment (CI
+   * spec D51). Launches Chromium, so it sits behind the lazy edge like the runner does; a machine
+   * without a browser gets a warning from `vdiff export`, not a failed export.
+   */
+  capturePreview(request: PreviewRequest): Promise<PreviewReport>;
+  /**
+   * `ci/index.ts#requestReview` — ask a hosted model to read a stored diff (CI spec D39). The one
+   * port in this file that opens a socket, and it says so: it reaches the API the caller's key
+   * belongs to and nothing else. Never called unless `vdiff review` is invoked with a key present.
+   */
+  requestReview(request: ReviewRequest): Promise<ReviewResponse>;
 
   /** `store/index.ts#openStore`. */
   openStore(config: Config): Promise<StorePort>;

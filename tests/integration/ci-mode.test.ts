@@ -119,7 +119,9 @@ describe('vdiff comment against a real store', () => {
     expect(comment.pair).toEqual({ flow: 'checkout', base: '0000', head: '0001' });
     expect(comment.marker).toBe('<!-- vdiff:checkout:pr -->');
     expect(comment.markdown.split('\n')[0]).toBe(comment.marker);
-    expect(comment.markdown).toContain('#### Findings');
+    // No findings table (D37): the counts live in the verdict line and the steps table.
+    expect(comment.markdown).toContain('**1 finding**');
+    expect(comment.markdown).not.toContain('#### Findings');
     // No image base was given, so no screenshots are embedded — and the command says why (D31).
     expect(comment.images).toBe(0);
     expect(comment.gate).toEqual({
@@ -197,10 +199,15 @@ describe('vdiff export against a real store', () => {
     expect(data.files).toContain('findings.json');
     expect(data.images).toBeGreaterThan(0);
 
-    // Every path the page addresses resolves to a file that is actually there — the failure this
-    // feature cannot have is a bundle of broken images.
+    // Every path the page's embedded snapshot addresses resolves to a file that is actually there —
+    // the failure this feature cannot have is a bundle of broken images (D38).
     const page = await readFile(join(data.outDir, 'report.html'), 'utf8');
-    const sources = [...page.matchAll(/<img src="([^"]+)"/g)].map((match) => match[1] as string);
+    const embedded = /<script type="application\/json" id="vdiff-snapshot">([\s\S]*?)<\/script>/.exec(
+      page,
+    );
+    expect(embedded, 'report.html must embed its snapshot').not.toBeNull();
+    const snapshot = JSON.parse(embedded?.[1] ?? '{}') as { images: Record<string, string> };
+    const sources = Object.values(snapshot.images);
     expect(sources.length).toBeGreaterThan(0);
     for (const source of sources) {
       expect(source.startsWith('http'), source).toBe(false);

@@ -5,6 +5,10 @@
  * Pure: images and snapshots in, a `ViewportDiff` plus the artifacts the engine writes out. All
  * geometry it returns is image-space, matching `pixel.png`, `regions.json` and the crops.
  *
+ * Two switches sit in front of all of it. A pair whose pixels are identical emits no findings at
+ * all (D53), and `diff.findings: false` turns the channel off outright (D54); both keep the pixel
+ * diff, the regions and the overlay, because those are what the reader looks at either way.
+ *
  * Config `ignore` applies to every finding-producing path here, not only to region clustering: an
  * ignored node (and its subtree) contributes no region, no node change — including the
  * pixel-free a11y pass — and no page-size finding it alone explains. Half-applied noise control is
@@ -38,8 +42,10 @@ import type { NodeChange } from '../types.js';
 import { classifyNodeChange, LAYOUT_SHIFT_PX } from './severity.js';
 import type { ContrastContext, Verdict } from './severity.js';
 import { withoutUnbackedChanges } from './fidelity.js';
-import { pixelDiff, renderPixelOverlay } from './pixel.js';
+import { changedOutside, pixelDiff, renderPixelOverlay } from './pixel.js';
 import { ignoreSelectorWarnings, matchesAny, selectorFor } from './selector.js';
+import { applyTolerance, hasChangedPixels, sameRelativePixels, sameScaledPixels, toleranceActive, toleratesLayout } from './tolerance.js';
+import { maxLengthDelta } from './severity.js';
 
 export interface ShotSide {
   shot: LoadedShot;
@@ -238,8 +244,13 @@ function emptyDiff(
 
 export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
   const { step, viewport, base, head, options } = input;
+  const emitFindings = options.emitFindings !== false;
+  const classifyTolerance = toleranceActive(options);
+  // Absent means every kind (D57).
+  const kinds = options.kinds === undefined ? undefined : new Set(options.kinds);
+  const wantedKind = (finding: Finding): boolean => kinds === undefined || kinds.has(finding.kind);
   // An ignore rule that cannot be evaluated must never pass for a rule that matched nothing.
-  const warnings = ignoreSelectorWarnings(options.ignore);
+  const warnings = options.emitWarnings === false ? [] : ignoreSelectorWarnings(options.ignore);
 
   if (base === null || head === null) {
     return {
@@ -259,6 +270,11 @@ export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
 
   // `ignore` is a findings contract, not just a region filter (spec §8, noise control): an ignored
   // node contributes no region, no node change, and no page-size finding of its own.
+  //
+  // Computed before the pixel gate rather than after it, because the *number* the gate reads is
+  // the one with these rects taken out (D56): an unpainted mask over a clock, or an ignored session
+  // badge, would otherwise carry a step past the gate and be reported as "0.3% of pixels changed"
+  // with no finding to explain it — a percentage the reviewer cannot act on and cannot dismiss.
   const ignoredBase = ignoredNodes(base.shot.dom.nodes, options.ignore);
   const ignoredHead = ignoredNodes(head.shot.dom.nodes, options.ignore);
   const isIgnored = (node: DomNode | null): boolean =>
@@ -269,15 +285,72 @@ export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
     ...exclusionRects(head, options.ignore, options.deviceScaleFactor, ignoredHead),
   ];
 
+  // What the report prints and what the gate reads: changed pixels the flow and the config did not
+  // already say to disregard.
+  const outside = changedOutside(pixels, exclude);
+
+  // ---- the pixel gate (D53). Not one finding is emitted for a pair that rendered identically:
+  // the pixel-free a11y pass and the page-size finding are the two paths that could reach a reader
+  // without a single pixel behind them, and a report that says "3 findings" for two screenshots
+  // the reader can see are the same teaches them to distrust the count. A dimension change *is* a
+  // pixel change — the image is a different size — so it does not pass through here.
+  //
+  // The whole of stage 5 is skipped with it, which is also why this returns rather than filtering
+  // at the end: matching two 5,000-node trees to emit nothing is work done for no one.
+  if (outside.changedRatio === 0 && !pixels.dimensionsChanged) {
+    const quietRegions = clusterRegions(pixels.mask, pixels.compared.w, pixels.compared.h, {
+      minRegionArea: options.minRegionArea,
+      maxRegions: options.maxRegions,
+      exclude,
+    });
+    return {
+      diff: {
+        viewport,
+        pixelChangedRatio: outside.changedRatio,
+        baseSize: pixels.base,
+        headSize: pixels.head,
+        dimensionsChanged: false,
+        regions: quietRegions.regions,
+        findings: [],
+      },
+      overlay: renderPixelOverlay(head.image, pixels),
+      regionSet: quietRegions,
+      cropSource: head.image,
+      warnings,
+    };
+  }
+
   const regionSet = clusterRegions(pixels.mask, pixels.compared.w, pixels.compared.h, {
     minRegionArea: options.minRegionArea,
     maxRegions: options.maxRegions,
     exclude,
   });
 
+  // Findings turned off (D54): the pixel diff, the regions and the overlay are exactly what they
+  // would have been — a project that wants the pictures and not the list gets the pictures — and
+  // the stages that only exist to explain a region are not run.
+  if (!emitFindings && !classifyTolerance) {
+    return {
+      diff: {
+        viewport,
+        pixelChangedRatio: outside.changedRatio,
+        baseSize: pixels.base,
+        headSize: pixels.head,
+        dimensionsChanged: pixels.dimensionsChanged,
+        regions: regionSet.regions,
+        findings: [],
+      },
+      overlay: renderPixelOverlay(head.image, pixels),
+      regionSet,
+      cropSource: head.image,
+      warnings,
+    };
+  }
+
   // ---- stage 5: node matching and classification, before attribution needs `rectChanged`.
   const match = matchNodes(base.shot.dom.nodes, head.shot.dom.nodes);
   const changesByPair = new Map<NodePair, NodeChange[]>();
+  const layoutRects: Rect[] = [];
   const changedNodes = new Set<DomNode>();
   /** Ignored pairs are kept only to attribute a page-size change; they never produce findings. */
   const ignoredPairs: NodePair[] = [];
@@ -291,10 +364,21 @@ export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
     // on a mixed pair, a high-severity "lost accessible name" for every named element (§4).
     const changes =
       input.degraded === true
-        ? withoutUnbackedChanges(diffNodePair(pair))
-        : diffNodePair(pair);
+        ? withoutUnbackedChanges(diffNodePair(pair, classifyTolerance ? 0 : undefined))
+        : diffNodePair(pair, classifyTolerance ? 0 : undefined);
     if (changes.length > 0) changesByPair.set(pair, changes);
-    if (rectChanged(pair)) {
+    // Only geometry-only pairs can explain tolerated pixels. A simultaneous text/style change
+    // keeps its evidence, even when the same element also moved by a tolerated distance.
+    if (classifyTolerance && pair.base !== null && pair.head !== null && changes.length > 0 && changes.every(change =>
+      (change.kind === 'moved' || change.kind === 'resized') &&
+      toleratesLayout(maxLengthDelta(change.changes), options))) {
+      const from = roundRect(scaleRect(pair.base.rect, scaleFor(base.shot, options.deviceScaleFactor)));
+      const to = roundRect(scaleRect(pair.head.rect, headScale));
+      const scalable = pair.base.tag === 'img' && pair.head.tag === 'img';
+      if (sameRelativePixels(base.image, head.image, from, to, exclude) ||
+        (scalable && sameScaledPixels(base.image, head.image, from, to, exclude))) layoutRects.push(from, to);
+    }
+    if (rectChanged(pair, classifyTolerance ? 0 : undefined)) {
       if (pair.base !== null) changedNodes.add(pair.base);
       if (pair.head !== null) changedNodes.add(pair.head);
     }
@@ -433,6 +517,29 @@ export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
     }
   }
 
+  // Tolerance cannot discard a confirmed edit just because its pixel region fell below the
+  // clustering floor. Require visible pixel evidence in the changed node's own bounds.
+  if (classifyTolerance) {
+    for (const changes of changesByPair.values()) {
+      for (const change of changes) {
+        if (emitted.has(change)) continue;
+        if ((change.kind === 'moved' || change.kind === 'resized') &&
+          toleratesLayout(maxLengthDelta(change.changes), options)) continue;
+        const rects: Rect[] = [];
+        if (change.base !== null) rects.push(roundRect(scaleRect(change.base.rect, scaleFor(base.shot, options.deviceScaleFactor))));
+        if (change.head !== null) rects.push(roundRect(scaleRect(change.head.rect, headScale)));
+        const region = rects.find(rect => hasChangedPixels(pixels, rect, exclude));
+        if (region === undefined) continue;
+        const verdict = verdicts.get(change) ?? classifyNodeChange(change, contrastCtx);
+        const element = elementFor(change.head ?? change.base);
+        findings.push({ id: '', kind: verdict.kind, severity: verdict.severity, step, viewport,
+          ...(element === undefined ? {} : { element }), region, nodeChange: change.kind,
+          changes: change.changes, label: verdict.label, reasons: verdict.reasons });
+        emitted.add(change);
+      }
+    }
+  }
+
   // ---- the capped remainder, as one entry (spec §8, stage 3).
   if (regionSet.collapsed > 0 && regionSet.collapsedRect !== null) {
     findings.push({
@@ -452,13 +559,19 @@ export function diffViewport(input: ViewportDiffInput): ViewportDiffOutput {
   const regions: Region[] = regionSet.regions;
   const diff: ViewportDiff = {
     viewport,
-    pixelChangedRatio: pixels.changedRatio,
+    pixelChangedRatio: outside.changedRatio,
     baseSize: pixels.base,
     headSize: pixels.head,
     dimensionsChanged: pixels.dimensionsChanged,
     regions,
-    findings: sortFindings(findings),
+    // Disabled semantic findings must not override the pixel allowance before being discarded.
+    // Geometry still enforces the independent layout tolerance, even with finding output off.
+    findings: sortFindings(findings.filter(finding =>
+      finding.kind === 'layout' || (emitFindings && wantedKind(finding)))),
   };
+
+  applyTolerance(diff, pixels, exclude, options, headScale, layoutRects);
+  diff.findings = emitFindings ? sortFindings(diff.findings.filter(wantedKind)) : [];
 
   return {
     diff,

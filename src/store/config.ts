@@ -12,6 +12,13 @@
  *   maxRegions: 40
  *   antialiasTolerance: 0.1
  *   ignore: ["[data-test=session-id]"]
+ *   findings: true
+ *   warnings: true
+ *   kinds: [content, style, layout, structural, a11y, console, network]
+ * capture:
+ *   a11y: true
+ *   console: true
+ *   network: true
  * network:
  *   redact: ["x-api-key"]
  * retention:
@@ -25,6 +32,11 @@
  * is validated strictly: an unknown key is an error carrying file, line and the offending key
  * (spec §10, row 1), because a silently ignored `minRegionAre:` typo is how a user concludes the
  * noise controls "don't work".
+ *
+ * `diff.findings` and `diff.warnings` turn the two report channels off for every pair (D54); the
+ * pixel diff, the regions and the overlays are computed either way. `diff.kinds` narrows *which*
+ * findings are emitted rather than whether any are (D57) — the scalpel next to that blunt switch. `vdiff diff --no-findings` and
+ * `--no-warnings` are the same switches for one invocation, and the flag wins over the file.
  *
  * `network.scrub` is deliberately **not** readable from the file: HAR scrubbing is disabled only
  * by an explicit `--no-scrub` (spec §6).
@@ -62,6 +74,8 @@ import * as paths from './paths.js';
 import type { E2eNoiseOverrides } from '../diff/e2e-noise.js';
 import {
   DEFAULTS,
+  FINDING_KINDS,
+  type BrowserConfig,
   type ValidationIssue,
   type ValidationResult,
 } from '../types.js';
@@ -74,6 +88,8 @@ const appSchema = z
     dev: z.string().min(1),
     readyOn: z.string().min(1),
     readyTimeout: z.string().min(1).optional(),
+    /** Per-action timeout inside a step; a cold `next dev` compiling a route needs more than 15s. */
+    stepTimeout: z.string().min(1).optional(),
   })
   .strict();
 
@@ -82,7 +98,23 @@ const diffSchema = z
     minRegionArea: z.number().int().nonnegative().optional(),
     maxRegions: z.number().int().positive().optional(),
     antialiasTolerance: z.number().min(0).max(1).optional(),
+    maxChangedPixelRatio: z.number().finite().min(0).max(1).optional(),
+    layout: z.object({
+      enabled: z.boolean().optional(),
+      tolerancePx: z.number().finite().nonnegative().optional(),
+    }).strict().optional(),
     ignore: z.array(z.string()).optional(),
+    // The two report channels (D54). Booleans, not levels: *how much* to report is what `ignore`,
+    // `minRegionArea` and the severity order are for.
+    findings: z.boolean().optional(),
+    warnings: z.boolean().optional(),
+    // *Which* kinds to report is a different question, and this is it (D57). An allowlist of the
+    // closed vocabulary, so a typo is an error naming the eight legal values rather than a kind
+    // that silently never appears.
+    kinds: z
+      .array(z.enum(FINDING_KINDS))
+      .min(1, 'kinds cannot be empty — write `findings: false` to turn the channel off instead')
+      .optional(),
   })
   .strict();
 
@@ -128,13 +160,56 @@ const e2eSchema = z
   .strict();
 
 /**
- * `browser:` — the context every replay starts from (auth spec §2). One key today: the path of a
- * Playwright storage-state file, relative to the project root. It is a session, so it stays under
- * the part of `.visual-diff/` that `vdiff init`'s gitignore block leaves untracked.
+ * `browser:` — the context every replay starts from (auth spec §2). The path of a Playwright
+ * storage-state file, relative to the project root — it is a session, so it stays under the part of
+ * `.visual-diff/` that `vdiff init`'s gitignore block leaves untracked — plus the certificate
+ * escape hatch, `maskColor` — the paint a flow `mask` covers its selectors with (D55) — and
+ * `mask: false`, which paints nothing at all and keeps only the exclusions (D56).
  */
+/**
+ * A CSS colour Playwright will accept as `maskColor`: a hex literal, or one of the two keywords a
+ * project actually reaches for. Validated here rather than passed through, because an unusable
+ * value silently falls back to magenta at capture time — the exact "the setting does nothing"
+ * failure the strict schema exists to prevent (D55).
+ */
+const cssColour = z
+  .string()
+  .trim()
+  .regex(
+    /^(#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})|transparent|white|black)$/,
+    'expected a hex colour like "#ffffff", or "white", "black" or "transparent"',
+  );
+
 const browserSchema = z
   .object({
     storageState: z.string().min(1).optional(),
+    /** Accept a self-signed certificate — a CI proxy with `tls internal` in front of the app. */
+    ignoreHTTPSErrors: z.boolean().optional(),
+    /** What a flow `mask` paints over its selectors (D55). Magenta unless a project says otherwise. */
+    maskColor: cssColour.optional(),
+    /** Whether a flow `mask` paints at all (D56). The exclusions survive either way. */
+    mask: z.boolean().optional(),
+  })
+  .strict()
+  // A colour for a mask that paints nothing is a setting the user believes is in force. Refused
+  // here, with both keys named, rather than silently preferring one of them (D56).
+  .refine((browser) => !(browser.mask === false && browser.maskColor !== undefined), {
+    message:
+      'browser.maskColor cannot combine with browser.mask: false — nothing is painted, so there ' +
+      'is no colour to choose; remove one of them',
+    path: ['maskColor'],
+  });
+
+/**
+ * `capture:` — what a run collects (D58). Every key optional and true by default, and validated
+ * strictly like the rest: `capture.a11yTree: false` must be an error naming the key, not a setting
+ * that quietly collects everything anyway.
+ */
+const captureSchema = z
+  .object({
+    a11y: z.boolean().optional(),
+    console: z.boolean().optional(),
+    network: z.boolean().optional(),
   })
   .strict();
 
@@ -143,6 +218,7 @@ const configSchema = z
     baseUrl: z.string().min(1).optional(),
     app: appSchema,
     browser: browserSchema.optional(),
+    capture: captureSchema.optional(),
     diff: diffSchema.optional(),
     network: networkSchema.optional(),
     retention: retentionSchema.optional(),
@@ -206,6 +282,7 @@ export function buildConfig(
   root: string,
   file: ConfigFile,
   readyTimeoutMs: number,
+  stepTimeoutMs?: number,
 ): NoiseAwareConfig {
   const config: NoiseAwareConfig = {
     root,
@@ -214,12 +291,32 @@ export function buildConfig(
       dev: file.app.dev,
       readyOn: file.app.readyOn,
       readyTimeoutMs,
+      ...(stepTimeoutMs === undefined ? {} : { stepTimeoutMs }),
     },
     diff: {
       minRegionArea: file.diff?.minRegionArea ?? DEFAULTS.diff.minRegionArea,
       maxRegions: file.diff?.maxRegions ?? DEFAULTS.diff.maxRegions,
       antialiasTolerance: file.diff?.antialiasTolerance ?? DEFAULTS.diff.antialiasTolerance,
+      maxChangedPixelRatio: file.diff?.maxChangedPixelRatio ?? DEFAULTS.diff.maxChangedPixelRatio,
+      layout: {
+        enabled: file.diff?.layout?.enabled ?? DEFAULTS.diff.layout.enabled,
+        tolerancePx: file.diff?.layout?.tolerancePx ?? DEFAULTS.diff.layout.tolerancePx,
+      },
       ignore: [...(file.diff?.ignore ?? DEFAULTS.diff.ignore)],
+      findings: file.diff?.findings ?? DEFAULTS.diff.findings,
+      warnings: file.diff?.warnings ?? DEFAULTS.diff.warnings,
+      // De-duplicated, and in the vocabulary's own order rather than the order they were written:
+      // this list is fingerprinted into the diff cache key, and two spellings of one choice must
+      // not key as two configurations.
+      kinds:
+        file.diff?.kinds === undefined
+          ? [...DEFAULTS.diff.kinds]
+          : FINDING_KINDS.filter((kind) => file.diff?.kinds?.includes(kind)),
+    },
+    capture: {
+      a11y: file.capture?.a11y ?? DEFAULTS.capture.a11y,
+      console: file.capture?.console ?? DEFAULTS.capture.console,
+      network: file.capture?.network ?? DEFAULTS.capture.network,
     },
     network: {
       redact: [...(file.network?.redact ?? DEFAULTS.network.redact)],
@@ -237,10 +334,19 @@ export function buildConfig(
   };
   if (file.app.install !== undefined) config.app.install = file.app.install;
   if (file.baseUrl !== undefined) config.baseUrl = file.baseUrl;
-  if (file.browser?.storageState !== undefined) {
+  if (file.browser !== undefined) {
+    const browser: BrowserConfig = {};
     // Against the working tree's root on purpose: a historical replay reads its flow from git but
     // its session from the machine it runs on.
-    config.browser = { storageState: path.resolve(root, file.browser.storageState) };
+    if (file.browser.storageState !== undefined) {
+      browser.storageState = path.resolve(root, file.browser.storageState);
+    }
+    if (file.browser.ignoreHTTPSErrors !== undefined) {
+      browser.ignoreHTTPSErrors = file.browser.ignoreHTTPSErrors;
+    }
+    if (file.browser.maskColor !== undefined) browser.maskColor = file.browser.maskColor;
+    if (file.browser.mask !== undefined) browser.mask = file.browser.mask;
+    if (Object.keys(browser).length > 0) config.browser = browser;
   }
 
   // Only what was written. An absent key stays absent all the way to `e2eNoiseSettings`, which is
@@ -314,7 +420,30 @@ export function parseConfigSource(
     readyTimeoutMs = ms;
   }
 
-  return { ok: true, value: buildConfig(root, parsed.data, readyTimeoutMs), warnings: [] };
+  let stepTimeoutMs: number | undefined;
+  const stepTimeoutRaw = parsed.data.app.stepTimeout;
+  if (stepTimeoutRaw !== undefined) {
+    const ms = parseDuration(stepTimeoutRaw);
+    if (ms === null) {
+      return {
+        ok: false,
+        issues: [
+          {
+            code: 'invalid-duration',
+            message: `app.stepTimeout "${stepTimeoutRaw}" needs a unit: 60s, 2m, 1500ms`,
+            at: locate(doc, lineCounter, file, ['app', 'stepTimeout']),
+          },
+        ],
+      };
+    }
+    stepTimeoutMs = ms;
+  }
+
+  return {
+    ok: true,
+    value: buildConfig(root, parsed.data, readyTimeoutMs, stepTimeoutMs),
+    warnings: [],
+  };
 }
 
 /* ------------------------------------------------------------------ locating the project */

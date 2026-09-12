@@ -11,13 +11,27 @@ import {
   makeSummary,
   makeViewportDiff,
 } from '../report/ui/test-fixtures.js';
+import type { ReportSnapshot } from '../report/ui/snapshot.js';
 import { TINY_PNG } from '../store/fixtures.js';
+import { fakeReview } from '../cli/testing.js';
+import { LOGO_URL } from './comment.js';
 import { exportBundle } from './export.js';
 import { evaluateGate } from './gate.js';
+import { significanceFingerprint } from '../diff/significance.js';
+import { commentFingerprint } from './review-triage.js';
 import type { BundleSummary } from './export.js';
 
 const PIXEL_PATH = 'diffs/checkout/0003..0007/steps/pay-form/1280x800/pixel.png';
 const CROP_PATH = 'diffs/checkout/0003..0007/crops/f1.png';
+
+/** The snapshot the page embeds (D38), parsed back out of the rendered HTML. */
+function snapshotOf(html: string): ReportSnapshot {
+  const match = /<script type="application\/json" id="vdiff-snapshot">([\s\S]*?)<\/script>/.exec(
+    html,
+  );
+  if (match === null) throw new Error('page carries no snapshot');
+  return JSON.parse(match[1] as string) as ReportSnapshot;
+}
 
 function fixtureDiff(): DiffResult {
   return makeDiff({
@@ -87,6 +101,41 @@ describe('exportBundle', () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it('filters AI noise in PR documents while preserving full findings, review and HTML evidence', async () => {
+    const result = fixtureDiff();
+    const finding = result.steps[0]!.viewports['1280x800']!.findings[0]!;
+    finding.changes = [];
+    finding.reasons = ['pixels-only'];
+    const assessment = { assessment: 'capture-noise' as const, confidence: 'high' as const, reason: 'Only the blinking caret differs.' };
+    const review = fakeReview({ engineVersion: result.engineVersion, diffFingerprint: significanceFingerprint(result), changes: [],
+      triage: { version: 1, comparedCells: [{ step: 'pay-form', viewport: '1280x800' }],
+        findings: [{ findingId: 'f1', ...assessment }],
+        viewports: [{ step: 'pay-form', viewport: '1280x800', ...assessment }] } });
+    const gate = evaluateGate(result.summary, 'any');
+    const report = await exportBundle({ root, result, review, gate, outDir: out, images: 'changed', preview: true,
+      version: 'test', generatedAt: '2026-09-10T00:00:00Z' });
+    expect(report.comment.markdown).toContain('AI classified the reviewed visual changes as capture noise');
+    expect(report.comment.markdown).not.toContain('3.0%');
+    expect(JSON.parse(await readFile(join(out, 'findings.json'), 'utf8'))).toEqual(result);
+    expect(JSON.parse(await readFile(join(out, 'review.json'), 'utf8'))).toEqual(review);
+    const snapshot = snapshotOf(await readFile(join(out, 'report.html'), 'utf8'));
+    expect(snapshot.diff).toEqual(result);
+    expect(snapshot.review).toEqual(review);
+    expect(snapshot.gate?.tripped).toBe(true);
+    expect(Object.keys(snapshot.images)).toHaveLength(4);
+    const preview = await readFile(join(out, 'preview.html'), 'utf8');
+    expect(preview).toContain(commentFingerprint(result, review));
+    expect(preview).not.toContain('3.0%');
+  });
+
+  it('keeps stale review data for audit but does not present it as the current HTML review', async () => {
+    const review = fakeReview({ diffFingerprint: 'old-diff' });
+    await exportBundle({ root, result: fixtureDiff(), review, outDir: out, images: 'none',
+      version: 'test', generatedAt: '2026-09-10T00:00:00Z' });
+    expect(snapshotOf(await readFile(join(out, 'report.html'), 'utf8')).review).toBeUndefined();
+    expect(JSON.parse(await readFile(join(out, 'review.json'), 'utf8'))).toEqual(review);
   });
 
   it('writes the four documents and the changed shots', async () => {
@@ -206,24 +255,157 @@ describe('exportBundle', () => {
     });
     const comment = await readFile(join(out, 'comment.md'), 'utf8');
     expect(comment).toContain('src="./images/pay-form/1280x800/pixel.png"');
-    expect(comment).not.toContain('http');
+    // Every picture of the *diff* resolves inside the bundle. The one external reference the
+    // comment may carry is the product mark in its heading, which is not evidence.
+    const sources = [...comment.matchAll(/<img src="([^"]+)"/g)].map((m) => m[1]);
+    expect(sources.length).toBeGreaterThan(1);
+    for (const src of sources) {
+      if (src === LOGO_URL) continue;
+      expect(src, src).toMatch(/^\.\/images\//);
+    }
+    expect(comment.replace(LOGO_URL, '')).not.toContain('http');
   });
 
-  it('renders a static page that requests nothing off its own directory', async () => {
+  it('renders the interactive page over an embedded snapshot, requesting nothing external (D38)', async () => {
     await exportBundle({
       root,
       result: fixtureDiff(),
       outDir: out,
       images: 'changed',
+      appScript: 'APP_STUB()',
       version: '0.6.0',
       generatedAt: '2026-08-11T09:00:00.000Z',
     });
     const html = await readFile(join(out, 'report.html'), 'utf8');
-    expect(html).not.toMatch(/<script/i);
     expect(html).not.toMatch(/https?:\/\//);
-    expect(html).toContain('src="images/pay-form/1280x800/base.png"');
-    // A cell whose files were not copied says so rather than showing a broken image.
-    expect(html).toContain('not in this bundle');
-    expect(html).toContain('findings.json');
+    expect(html).toContain('<script>APP_STUB()</script>');
+
+    const snapshot = snapshotOf(html);
+    expect(snapshot.flow).toBe('checkout');
+    expect(snapshot.diff.pair).toEqual({ base: '0003', head: '0007' });
+    expect(snapshot.runs.map((r) => r.runId)).toEqual(['0003', '0007']);
+    // Linked mode: every image the map offers is a bundle-relative path to a file that copied —
+    // a source that was absent is simply not in the map, never a broken reference.
+    const values = Object.values(snapshot.images);
+    expect(values.length).toBeGreaterThan(0);
+    for (const value of values) expect(value.startsWith('images/')).toBe(true);
+    expect(values).toContain('images/pay-form/1280x800/base.png');
+  });
+
+  it('writes a page with the data and a note when the app script is not available', async () => {
+    await exportBundle({
+      root,
+      result: fixtureDiff(),
+      outDir: out,
+      images: 'changed',
+      appScript: null,
+      version: '0.6.0',
+      generatedAt: '2026-08-11T09:00:00.000Z',
+    });
+    const html = await readFile(join(out, 'report.html'), 'utf8');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('exported without the report UI');
+    expect(snapshotOf(html).flow).toBe('checkout');
+  });
+
+  it('embeds the shots under html=inline, so report.html alone is the report', async () => {
+    const report = await exportBundle({
+      root,
+      result: fixtureDiff(),
+      outDir: out,
+      images: 'changed',
+      html: 'inline',
+      appScript: 'APP_STUB()',
+      version: '0.6.0',
+      generatedAt: '2026-08-11T09:00:00.000Z',
+    });
+    const snapshot = snapshotOf(await readFile(join(out, 'report.html'), 'utf8'));
+    const values = Object.values(snapshot.images);
+    expect(values.length).toBeGreaterThan(0);
+    for (const value of values) expect(value.startsWith('data:image/png;base64,')).toBe(true);
+    // The rest of the bundle is untouched: images/ still ships, and no second page appears.
+    expect(report.files).toContain('images/pay-form/1280x800/base.png');
+    expect(report.files).not.toContain('report.inline.html');
+  });
+
+  it('writes the linked page plus report.inline.html under html=both', async () => {
+    const report = await exportBundle({
+      root,
+      result: fixtureDiff(),
+      outDir: out,
+      images: 'changed',
+      html: 'both',
+      appScript: 'APP_STUB()',
+      version: '0.6.0',
+      generatedAt: '2026-08-11T09:00:00.000Z',
+    });
+    expect(report.files).toContain('report.html');
+    expect(report.files).toContain('report.inline.html');
+    const linked = snapshotOf(await readFile(join(out, 'report.html'), 'utf8'));
+    expect(Object.values(linked.images)).toContain('images/pay-form/1280x800/base.png');
+    const inline = snapshotOf(await readFile(join(out, 'report.inline.html'), 'utf8'));
+    for (const value of Object.values(inline.images)) {
+      expect(value.startsWith('data:image/png;base64,')).toBe(true);
+    }
+    const summary = JSON.parse(await readFile(join(out, 'summary.json'), 'utf8')) as BundleSummary;
+    expect(summary.html).toBe('both');
+    expect(summary.files).toContain('report.inline.html');
+  });
+});
+
+describe('exportBundle with a review (D39)', () => {
+  let root: string;
+  let out: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'vdiff-export-review-'));
+    out = join(root, 'bundle');
+    await seedStore(root);
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('writes review.json, renders it into comment.md and embeds it in the snapshot', async () => {
+    const review = fakeReview({ headline: 'The Pay button grew wider.' });
+    const report = await exportBundle({
+      root,
+      result: fixtureDiff(),
+      outDir: out,
+      images: 'changed',
+      appScript: 'APP_STUB()',
+      version: '0.9.0',
+      generatedAt: '2026-09-07T09:00:00.000Z',
+      review,
+    });
+    expect(report.files).toContain('review.json');
+    expect(JSON.parse(await readFile(join(out, 'review.json'), 'utf8'))).toEqual(review);
+
+    const comment = await readFile(join(out, 'comment.md'), 'utf8');
+    expect(comment).toContain('#### Review');
+    expect(comment).toContain('**The Pay button grew wider.**');
+
+    const snapshot = snapshotOf(await readFile(join(out, 'report.html'), 'utf8'));
+    expect(snapshot.review).toEqual(review);
+
+    const summary = JSON.parse(await readFile(join(out, 'summary.json'), 'utf8')) as BundleSummary;
+    expect(summary.review).toEqual(review);
+    expect(summary.files).toContain('review.json');
+  });
+
+  it('writes the bundle exactly as before when there is no review', async () => {
+    const report = await exportBundle({
+      root,
+      result: fixtureDiff(),
+      outDir: out,
+      images: 'changed',
+      version: '0.9.0',
+      generatedAt: '2026-09-07T09:00:00.000Z',
+    });
+    expect(report.files).not.toContain('review.json');
+    const summary = JSON.parse(await readFile(join(out, 'summary.json'), 'utf8')) as BundleSummary;
+    expect(summary.review).toBeNull();
+    expect(await readFile(join(out, 'comment.md'), 'utf8')).not.toContain('#### Review');
   });
 });

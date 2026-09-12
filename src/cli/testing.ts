@@ -20,6 +20,7 @@ import {
   type FlowSpec,
   type PairRef,
   type PairScenarios,
+  type Review,
   type RunId,
   type RunMeta,
   type RunResult,
@@ -29,7 +30,7 @@ import {
   type ServeInfo,
 } from '../types.js';
 
-import { exportBundle, renderComment } from '../ci/index.js';
+import { exportBundle, renderComment, type ReviewRequest, type ReviewResponse } from '../ci/index.js';
 
 import type {
   FileOutcome,
@@ -213,11 +214,17 @@ export function fakeConfig(root = '/project', overrides: Partial<Config> = {}): 
       readyOn: 'http://localhost:$PORT/',
       readyTimeoutMs: DEFAULTS.readyTimeoutMs,
     },
+    capture: { ...DEFAULTS.capture },
     diff: {
       minRegionArea: DEFAULTS.diff.minRegionArea,
       maxRegions: DEFAULTS.diff.maxRegions,
       antialiasTolerance: DEFAULTS.diff.antialiasTolerance,
+      maxChangedPixelRatio: DEFAULTS.diff.maxChangedPixelRatio,
+      layout: { ...DEFAULTS.diff.layout },
       ignore: [...DEFAULTS.diff.ignore],
+      findings: DEFAULTS.diff.findings,
+      warnings: DEFAULTS.diff.warnings,
+      kinds: [...DEFAULTS.diff.kinds],
     },
     network: { redact: [...DEFAULTS.network.redact], scrub: DEFAULTS.network.scrub },
     retention: { keepRuns: DEFAULTS.retention.keepRuns },
@@ -419,6 +426,10 @@ export function emptyDiffSummary(overrides: Partial<DiffSummary> = {}): DiffSumm
 export function fakeDiffResult(overrides: Partial<DiffResult> = {}): DiffResult {
   return {
     engineVersion: DIFF_ENGINE_VERSION,
+    tolerance: {
+      maxChangedPixelRatio: DEFAULTS.diff.maxChangedPixelRatio,
+      layout: { ...DEFAULTS.diff.layout },
+    },
     flow: 'checkout',
     pair: { base: '0003', head: '0007' },
     computedAt: '2026-08-08T10:05:00Z',
@@ -428,6 +439,31 @@ export function fakeDiffResult(overrides: Partial<DiffResult> = {}): DiffResult 
     steps: [],
     summary: emptyDiffSummary(),
     warnings: [],
+    ...overrides,
+  };
+}
+
+/** A stored review of the default fixture pair (CI spec D39). */
+export function fakeReview(overrides: Partial<Review> = {}): Review {
+  return {
+    flow: 'checkout',
+    pair: { base: '0003', head: '0007' },
+    engineVersion: DIFF_ENGINE_VERSION,
+    provider: 'anthropic',
+    model: 'claude-opus-5',
+    generatedAt: '2026-08-08T10:06:00Z',
+    headline: 'The Pay button now reads "Pay now" and is 26px wider.',
+    summary: 'The Pay button label changed and grew wider; nothing else moved.',
+    changes: [
+      {
+        step: 'pay-form',
+        viewport: '1280x800',
+        description: 'The primary button now reads "Pay now" and is 26px wider.',
+        assessment: 'expected',
+      },
+    ],
+    concerns: [],
+    evidence: { cells: 1, images: 3, contextProvided: false },
     ...overrides,
   };
 }
@@ -469,6 +505,8 @@ export interface TestStoreState {
   runs: Record<string, RunSummary[]>;
   /** "<flow>/<base>..<head>" → stored diff. */
   diffs: Record<string, DiffResult>;
+  /** "<flow>/<base>..<head>" → stored review (CI spec D39). */
+  reviews: Record<string, Review>;
   pending: FeedbackEntry[];
   /** Every mutation the CLI asked for, in order — lets a test assert delegation. */
   calls: string[];
@@ -621,6 +659,7 @@ export function createTestStore(state: Partial<TestStoreState> = {}): StorePort 
     root: state.root ?? '/project',
     runs: state.runs ?? {},
     diffs: state.diffs ?? {},
+    reviews: state.reviews ?? {},
     pending: state.pending ?? [],
     calls: state.calls ?? [],
   };
@@ -653,6 +692,23 @@ export function createTestStore(state: Partial<TestStoreState> = {}): StorePort 
       store.diffs[key(pair)] = result;
       store.calls.push(`writeDiff ${key(pair)}`);
       return `${dir}/diffs/${key(pair)}/findings.json`;
+    },
+    // The engine-version rule, exactly as the real store applies it: a review of a recomputed diff
+    // is about a diff that no longer exists, so it reads as absent.
+    readReview: async (pair: PairRef, engineVersion?: string) => {
+      const stored = store.reviews[key(pair)] ?? null;
+      if (stored === null) return null;
+      if (engineVersion !== undefined && stored.engineVersion !== engineVersion) return null;
+      return stored;
+    },
+    writeReview: async (pair: PairRef, review: Review) => {
+      store.reviews[key(pair)] = review;
+      store.calls.push(`writeReview ${key(pair)}`);
+      return `${dir}/diffs/${key(pair)}/review.json`;
+    },
+    invalidateReview: async (pair: PairRef) => {
+      delete store.reviews[key(pair)];
+      store.calls.push(`invalidateReview ${key(pair)}`);
     },
     pinRun: async (flow: string, runId: RunId) => {
       store.calls.push(`pinRun ${flow} ${runId}`);
@@ -716,6 +772,22 @@ export function createTestPorts(overrides: Partial<Ports> = {}): Ports {
     // test. `exportBundle` writes to whatever directory the test names, which is a temp dir.
     renderComment: async (input) => renderComment(input),
     exportBundle: async (request) => exportBundle(request),
+    // Photographing the page needs a browser, which a command test must not launch; the fake
+    // reports the two files without writing them. A test that wants the failure path overrides it.
+    capturePreview: async () => ({ files: ['images/preview.png', 'images/preview-dark.png'] }),
+    // The one port that would open a socket is faked outright: a command test must never reach a
+    // model API. The default answers with a canned review shaped by the request it received.
+    requestReview: async (request: ReviewRequest): Promise<ReviewResponse> => ({
+      review: fakeReview({
+        flow: request.result.flow,
+        pair: request.result.pair,
+        engineVersion: request.result.engineVersion,
+        provider: request.provider,
+        model: request.model,
+      }),
+      usage: { inputTokens: 1200, outputTokens: 300 },
+      images: 0,
+    }),
     serveReport: async (_config: Config, _options): Promise<ServeHandle> => ({
       info: fakeServeInfo(),
       close: async () => undefined,

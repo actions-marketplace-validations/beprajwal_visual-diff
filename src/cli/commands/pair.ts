@@ -1,3 +1,4 @@
+import { sameTolerance } from '../../diff/tolerance.js';
 /**
  * cli — resolving a pair and getting its diff, once for the three commands that need it.
  *
@@ -17,10 +18,14 @@
 import {
   DEFAULTS,
   DIFF_ENGINE_VERSION,
+  FINDING_KINDS,
   type Config,
+  type DiffEmitChannels,
   type DiffEngineOptions,
   type DiffResult,
+  type FindingKind,
   type PairRef,
+  type Review,
   type RunId,
   type ScenarioName,
 } from '../../types.js';
@@ -36,6 +41,10 @@ export interface PairSelection {
   scenario?: ScenarioName;
   variant?: VariantName;
   e2e: boolean;
+  /** `--no-findings`: compute the pixel diff and emit no findings (D54). */
+  noFindings?: boolean;
+  /** `--no-warnings`: store an empty warnings list (D54). */
+  noWarnings?: boolean;
 }
 
 export interface ResolvedPair {
@@ -48,6 +57,12 @@ export interface ResolvedPair {
   cached: boolean;
   /** Default bundle directory for this pair, whether or not anything writes it (CI spec §5). */
   exportDir: string;
+  /**
+   * The stored `review.json` for this pair (CI spec D39), or null. Read here so `comment` and
+   * `export` render the same review — or the same absence of one — for the same pair; a review of
+   * a diff since recomputed under another engine version reads as null, as the store promises.
+   */
+  review: Review | null;
 }
 
 /**
@@ -68,16 +83,75 @@ export function pairFilter(selection: PairSelection): RunFilter {
   return filter;
 }
 
-/** The engine options, taken from config exactly as `vdiff diff` takes them. */
-export function diffOptions(config: Config): DiffEngineOptions {
+/**
+ * The engine options, taken from config exactly as `vdiff diff` takes them.
+ *
+ * The flag wins over the file, in one direction only: `--no-findings` turns a channel off that
+ * config left on, and there is no flag that turns one back on. A project that wrote
+ * `diff.findings: false` decided that for every invocation, and a switch that could be undone per
+ * command is a switch whose effect nobody can predict from the config.
+ */
+export function diffOptions(config: Config, selection?: PairSelection): DiffEngineOptions {
+  const emitFindings = config.diff.findings !== false && selection?.noFindings !== true;
+  const emitWarnings = config.diff.warnings !== false && selection?.noWarnings !== true;
   return {
     minRegionArea: config.diff.minRegionArea,
     maxRegions: config.diff.maxRegions,
     antialiasTolerance: config.diff.antialiasTolerance,
+    ...(config.diff.maxChangedPixelRatio === undefined ? {} : { maxChangedPixelRatio: config.diff.maxChangedPixelRatio }),
+    ...(config.diff.layout === undefined ? {} : { layout: config.diff.layout }),
     ignore: config.diff.ignore,
     engineVersion: DIFF_ENGINE_VERSION,
     deviceScaleFactor: DEFAULTS.deviceScaleFactor,
+    emitFindings,
+    emitWarnings,
+    // Only when the project narrowed it: absent means every kind, which is what the engine and the
+    // cache key both already mean by "no list" (D57).
+    ...(sameKinds(config.diff.kinds, FINDING_KINDS) ? {} : { kinds: [...config.diff.kinds] }),
   };
+}
+
+/**
+ * The kinds this diff was not allowed to emit, in the vocabulary's order, or empty.
+ *
+ * Named here so the CLI, the comment and the report rail say the same thing about the same diff: an
+ * absent `console` finding means "none happened" or "nobody looked", and those must not read alike
+ * (D57).
+ */
+export function omittedKindsOf(result: DiffResult): FindingKind[] {
+  const allowed = emitChannelsOf(result).kinds;
+  if (allowed === undefined) return [];
+  return FINDING_KINDS.filter((kind) => !allowed.includes(kind));
+}
+
+/** Whether two kind lists say the same thing. Order and duplicates are not the choice. */
+function sameKinds(a: readonly FindingKind[], b: readonly FindingKind[]): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every((kind) => right.has(kind));
+}
+
+/** What a stored diff was computed with (D54). No `emit` block means both channels were on. */
+export function emitChannelsOf(result: DiffResult): DiffEmitChannels {
+  return result.emit ?? { findings: true, warnings: true };
+}
+
+/**
+ * Whether a stored diff answers the question this invocation is asking.
+ *
+ * The engine version is not enough on its own. A diff computed under `--no-findings` carries an
+ * empty findings list, and reusing it for a caller that wants findings would report "no findings"
+ * for a pair nobody has looked at — the one wrong answer this cache must never give. The reverse
+ * costs one recompute.
+ */
+function answersThisRequest(stored: DiffResult, options: DiffEngineOptions): boolean {
+  const emitted = emitChannelsOf(stored);
+  return (
+    sameTolerance(stored.tolerance, options) &&
+    emitted.findings === (options.emitFindings !== false) &&
+    emitted.warnings === (options.emitWarnings !== false) &&
+    sameKinds(emitted.kinds ?? FINDING_KINDS, options.kinds ?? FINDING_KINDS)
+  );
 }
 
 /** Resolve the pair and produce its diff, reusing the stored one when the engine still matches. */
@@ -94,9 +168,12 @@ export async function resolveDiff(
     pairFilter(selection),
   );
 
-  const options = diffOptions(config);
+  const options = diffOptions(config, selection);
   const stored = await store.readDiff(pair);
-  const reusable = stored !== null && stored.engineVersion === options.engineVersion;
+  const reusable =
+    stored !== null &&
+    stored.engineVersion === options.engineVersion &&
+    answersThisRequest(stored, options);
 
   if (reusable && stored !== null) {
     return {
@@ -106,6 +183,7 @@ export async function resolveDiff(
       path: store.diffFile(pair),
       cached: true,
       exportDir: store.exportDir(pair),
+      review: await store.readReview(pair, stored.engineVersion),
     };
   }
 
@@ -115,7 +193,17 @@ export async function resolveDiff(
     options,
   );
   const path = await store.writeDiff(pair, result);
-  return { config, pair, result, path, cached: false, exportDir: store.exportDir(pair) };
+  // A freshly computed diff has no review yet by definition: whatever `review.json` may be on disk
+  // described the previous engine's findings, and the engine-version check says so.
+  return {
+    config,
+    pair,
+    result,
+    path,
+    cached: false,
+    exportDir: store.exportDir(pair),
+    review: await store.readReview(pair, result.engineVersion),
+  };
 }
 
 /** The commands that reproduce a pair locally. Rendered into a comment's footer (CI spec §6). */

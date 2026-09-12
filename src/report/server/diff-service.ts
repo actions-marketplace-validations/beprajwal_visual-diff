@@ -18,9 +18,10 @@ import type {
   RunId,
   RunMeta,
 } from '../../types.js';
-import { DEFAULTS, DIFF_ENGINE_VERSION } from '../../types.js';
+import { DEFAULTS, DIFF_ENGINE_VERSION, FINDING_KINDS } from '../../types.js';
 import type { ComputeDiffFn, ReportStore } from './deps.js';
 import { HttpError } from './http.js';
+import { sameTolerance } from '../../diff/tolerance.js';
 
 export interface DiffServiceOptions {
   store: ReportStore;
@@ -62,12 +63,21 @@ export function createDiffService(options: DiffServiceOptions): DiffService {
     minRegionArea: config.diff.minRegionArea,
     maxRegions: config.diff.maxRegions,
     antialiasTolerance: config.diff.antialiasTolerance,
+    ...(config.diff.maxChangedPixelRatio === undefined ? {} : { maxChangedPixelRatio: config.diff.maxChangedPixelRatio }),
+    ...(config.diff.layout === undefined ? {} : { layout: config.diff.layout }),
     ignore: config.diff.ignore,
     engineVersion,
     deviceScaleFactor:
       headMeta.env?.deviceScaleFactor ??
       baseMeta.env?.deviceScaleFactor ??
       DEFAULTS.deviceScaleFactor,
+    // The report computes under the project's own switches (D54), or a config that turned a
+    // channel off would find it back on the moment a pair was diffed by the server instead.
+    emitFindings: config.diff.findings !== false,
+    emitWarnings: config.diff.warnings !== false,
+    ...(config.diff.kinds === undefined || config.diff.kinds.length === FINDING_KINDS.length
+      ? {}
+      : { kinds: [...config.diff.kinds] }),
   });
 
   async function resolve(flow: string, base: RunId, head: RunId): Promise<DiffResponse> {
@@ -98,7 +108,7 @@ export function createDiffService(options: DiffServiceOptions): DiffService {
     }
 
     const stored = await store.readCachedDiff(flow, base, head);
-    if (stored && stored.engineVersion === engineVersion) {
+    if (stored && stored.engineVersion === engineVersion && sameTolerance(stored.tolerance, config.diff)) {
       cache.set(key(flow, base, head), stored);
       return stored;
     }
@@ -138,7 +148,7 @@ export function createDiffService(options: DiffServiceOptions): DiffService {
     async get(flow, base, head) {
       const k = key(flow, base, head);
       const memo = cache.get(k);
-      if (memo) return memo;
+      if (memo && sameTolerance(memo.tolerance, config.diff)) return memo;
 
       const pending = inFlight.get(k);
       if (pending) return pending;

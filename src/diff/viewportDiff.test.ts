@@ -3,6 +3,10 @@
  * tests pin the "no finding at all" promise on every path that can produce one: the region merge,
  * the pixel-free a11y pass, and the page-size finding — plus the warning that fires when an ignore
  * rule cannot be evaluated, because a rule that silently does nothing is worse than no rule.
+ *
+ * The pixel gate (D53) and the two emit switches (D54) sit in front of all of it, and are pinned
+ * here too: a pair that rendered identically reports nothing, and `emitFindings: false` reports
+ * nothing while still producing the pixel diff and its regions.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -58,6 +62,201 @@ function body(height = 100): DomNode {
     rect: { x: 0, y: 0, w: 100, h: height },
   });
 }
+
+describe('visual tolerance', () => {
+  const compare = (base: ShotSide, head: ShotSide, overrides = {}) => diffViewport({
+    step: 'cart', viewport: VIEWPORT, base, head,
+    options: defaultDiffOptions({ deviceScaleFactor: 1, minRegionArea: 1,
+      ...overrides }),
+  }).diff;
+
+  it('keeps pixels and findings at the inclusive pixel boundary, marked within tolerance', () => {
+    const base = side(solidImage(100, 100), []);
+    const head = side(paintRect(solidImage(100, 100), { x: 10, y: 10, w: 5, h: 6 }, RED), []);
+    const diff = compare(base, head);
+    expect(diff.pixelChangedRatio).toBe(0.003);
+    expect(diff.withinTolerance).toBe(true);
+    expect(diff.findings.length).toBeGreaterThan(0);
+    expect(diff.findings.every(f => f.withinTolerance)).toBe(true);
+    expect(diff.regions.length).toBeGreaterThan(0);
+  });
+
+  it('flags pixels above the allowance and honors masks before applying it', () => {
+    const image = paintRect(solidImage(100, 100), { x: 10, y: 10, w: 6, h: 6 }, RED);
+    expect(compare(side(solidImage(100, 100), []), side(image, [])).withinTolerance).not.toBe(true);
+    const mask = { x: 10, y: 10, w: 1, h: 6 };
+    const diff = compare(side(solidImage(100, 100), [], [mask]), side(image, [], [mask]));
+    expect(diff.pixelChangedRatio).toBe(0.003);
+    expect(diff.withinTolerance).toBe(true);
+  });
+
+  it('restores previous sensitivity when both allowances are explicitly reset', () => {
+    const diff = compare(side(solidImage(100, 100), []),
+      side(paintRect(solidImage(100, 100), { x: 10, y: 10, w: 5, h: 6 }, RED), []),
+      { maxChangedPixelRatio: 0, layout: { enabled: true, tolerancePx: 0.5 } });
+    expect(diff.withinTolerance).toBeUndefined();
+    expect(diff.findings.length).toBeGreaterThan(0);
+    expect(diff.findings.every(f => !f.withinTolerance)).toBe(true);
+  });
+
+  it('preserves a real text change occupying only 0.3% of the screenshot', () => {
+    const rect = { x: 10, y: 10, w: 5, h: 6 };
+    const node = (text: string) => domNode({ path: 'button', tag: 'button', rect, text });
+    const diff = compare(side(solidImage(100, 100), [node('Buy')]),
+      side(paintRect(solidImage(100, 100), rect, RED), [node('Pay')]));
+    expect(diff.findings.some(f => f.nodeChange === 'text' && !f.withinTolerance)).toBe(true);
+    expect(diff.withinTolerance).not.toBe(true);
+  });
+
+  it('protects a real text edit below the default minimum region area', () => {
+    const rect = { x: 10, y: 10, w: 5, h: 6 };
+    const node = (text: string) => domNode({ path: 'button', tag: 'button', rect, text });
+    const diff = compare(side(solidImage(100, 100), [node('Buy')]),
+      side(paintRect(solidImage(100, 100), rect, RED), [node('Pay')]), { minRegionArea: 64 });
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.findings.some(f => f.nodeChange === 'text' && !f.withinTolerance)).toBe(true);
+  });
+
+  it.each(['src', 'aria-label'])('does not let a disabled %s finding override pixel tolerance', (prop) => {
+    const rect = { x: 10, y: 10, w: 20, h: 20 };
+    const node = (value: string) => domNode({ path: 'img', tag: 'img', rect, attrs: { [prop]: value } });
+    const diff = compare(side(solidImage(100, 100), [node('before')]),
+      side(paintRect(solidImage(100, 100), { ...rect, w: 1, h: 11 }, RED), [node('after')]),
+      { emitFindings: false });
+    expect(diff.pixelChangedRatio).toBe(0.0011);
+    expect(diff.findings).toEqual([]);
+    expect(diff.regions.length).toBeGreaterThan(0);
+    expect(diff.withinTolerance).toBe(true);
+    expect(diff.significantPixelChangedRatio).toBe(0);
+  });
+
+  it('does not let an excluded finding kind override pixel tolerance', () => {
+    const rect = { x: 10, y: 10, w: 20, h: 20 };
+    const node = (src: string) => domNode({ path: 'img', tag: 'img', rect, attrs: { src } });
+    const diff = compare(side(solidImage(100, 100), [node('before')]),
+      side(paintRect(solidImage(100, 100), { ...rect, w: 1, h: 11 }, RED), [node('after')]),
+      { kinds: ['layout'] });
+    expect(diff.findings).toEqual([]);
+    expect(diff.withinTolerance).toBe(true);
+  });
+
+  it('keeps a repaint above pixel tolerance when findings are disabled', () => {
+    const rect = { x: 10, y: 10, w: 20, h: 20 };
+    const node = (src: string) => domNode({ path: 'img', tag: 'img', rect, attrs: { src } });
+    const diff = compare(side(solidImage(100, 100), [node('before')]),
+      side(paintRect(solidImage(100, 100), rect, RED), [node('after')]),
+      { emitFindings: false });
+    expect(diff.findings).toEqual([]);
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.significantPixelChangedRatio).toBe(0.04);
+  });
+
+  const moved = (distance: number, extraPixels = false) => {
+    const rect = { x: 10, y: 10, w: 40, h: 20 };
+    const to = { ...rect, x: rect.x + distance };
+    const node = (r: Rect) => domNode({ path: 'button', tag: 'button', rect: r, text: 'Buy' });
+    const image = paintRect(solidImage(100, 100), to, RED);
+    if (extraPixels) paintRect(image, { x: 75, y: 75, w: 10, h: 10 }, RED);
+    return [side(paintRect(solidImage(100, 100), rect, RED), [node(rect)]),
+      side(image, [node(to)])] as const;
+  };
+
+  it('tolerates a 2px layout shift even when its pixel footprint exceeds the allowance', () => {
+    const diff = compare(...moved(2));
+    expect(diff.pixelChangedRatio).toBeGreaterThan(0.003);
+    expect(diff.withinTolerance).toBe(true);
+    expect(diff.findings.some(f => f.kind === 'layout' && f.withinTolerance)).toBe(true);
+    expect(diff.findings.every(f => f.withinTolerance)).toBe(true);
+  });
+
+  it('keeps unrelated changed pixels beside a tolerated shift significant', () => {
+    const diff = compare(...moved(2, true));
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.findings.some(f => f.kind === 'layout' && f.withinTolerance)).toBe(true);
+    expect(diff.findings.some(f => f.reasons.includes('pixels-only') && !f.withinTolerance)).toBe(true);
+    expect(diff.pixelChangedRatio).toBe(0.018);
+    expect(diff.significantPixelChangedRatio).toBe(0.01);
+  });
+
+  it('does not let a moved container hide an unexplained repaint inside it', () => {
+    const [base, head] = moved(2);
+    paintRect(head.image, { x: 20, y: 15, w: 10, h: 10 }, [0, 0, 255, 255]);
+    const diff = compare(base, head);
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.findings.some(f => f.reasons.includes('pixels-only') && !f.withinTolerance)).toBe(true);
+  });
+
+  it('ignores masked pixels when proving that a tolerated move kept its content', () => {
+    const [base, head] = moved(2);
+    const clock = { x: 22, y: 15, w: 10, h: 10 };
+    paintRect(head.image, clock, [0, 0, 255, 255]);
+    base.shot.dom.masks = [{ ...clock, x: 20 }];
+    head.shot.dom.masks = [clock];
+    expect(compare(base, head).withinTolerance).toBe(true);
+  });
+
+  it('retains an actionable pixel finding when a tolerated resize and repaint share one region', () => {
+    const rect = { x: 10, y: 10, w: 40, h: 20 };
+    const to = { ...rect, w: 42 };
+    const node = (r: Rect) => domNode({ path: 'canvas', tag: 'canvas', rect: r });
+    const image = paintRect(paintRect(solidImage(100, 100), to, RED),
+      { x: 40, y: 10, w: 12, h: 20 }, [0, 0, 255, 255]);
+    const diff = compare(side(paintRect(solidImage(100, 100), rect, RED), [node(rect)]), side(image, [node(to)]));
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.findings.some(f => !f.withinTolerance && f.reasons.includes('pixels-only'))).toBe(true);
+  });
+
+  it('recognizes unchanged image content scaled by a tolerated resize', () => {
+    const rect = { x: 10, y: 10, w: 40, h: 20 };
+    const to = { ...rect, w: 42 };
+    const node = (r: Rect) => domNode({ path: 'img', tag: 'img', rect: r });
+    const image = (r: Rect) => paintRect(paintRect(solidImage(100, 100), r, RED),
+      { ...r, x: r.x + r.w / 2, w: r.w / 2 }, [0, 0, 255, 255]);
+    const diff = compare(side(image(rect), [node(rect)]), side(image(to), [node(to)]));
+    expect(diff.pixelChangedRatio).toBe(0.006);
+    expect(diff.withinTolerance).toBe(true);
+  });
+
+  it('flags movement above layout tolerance, independently of the pixel allowance', () => {
+    const diff = compare(...moved(3), { maxChangedPixelRatio: 1 });
+    expect(diff.withinTolerance).not.toBe(true);
+    expect(diff.findings.some(f => f.kind === 'layout' && !f.withinTolerance)).toBe(true);
+  });
+
+  it('honors layout tolerance independently when findings are disabled', () => {
+    const options = { emitFindings: false, maxChangedPixelRatio: 1 };
+    expect(compare(...moved(2), options).withinTolerance).toBe(true);
+    const significant = compare(...moved(3), options);
+    expect(significant.findings).toEqual([]);
+    expect(significant.withinTolerance).not.toBe(true);
+  });
+
+  it('can disable layout flags and still classify when findings are off', () => {
+    expect(compare(...moved(12), { layout: { enabled: false, tolerancePx: 2 } }).withinTolerance).toBe(true);
+    const diff = compare(...moved(2), { emitFindings: false });
+    expect(diff.findings).toEqual([]);
+    expect(diff.withinTolerance).toBe(true);
+  });
+
+  it('applies CSS-pixel layout tolerance to page dimensions', () => {
+    expect(compare(side(solidImage(100, 100), []), side(solidImage(100, 102), [])).withinTolerance).toBe(true);
+    expect(compare(side(solidImage(100, 100), []), side(solidImage(100, 103), []),
+      { maxChangedPixelRatio: 1 }).withinTolerance).not.toBe(true);
+  });
+
+  it('classifies subpixel geometry independently of the pixel allowance', () => {
+    const [base, head] = moved(1);
+    for (const entry of [base, head]) {
+      entry.shot.dom.deviceScaleFactor = 4;
+      const rect = entry.shot.dom.nodes[0]!.rect;
+      entry.shot.dom.nodes[0]!.rect = { x: rect.x / 4, y: rect.y / 4, w: rect.w / 4, h: rect.h / 4 };
+    }
+    expect(compare(base, head, { maxChangedPixelRatio: 0 }).withinTolerance).toBe(true);
+    const strict = compare(base, head, { maxChangedPixelRatio: 1, layout: { tolerancePx: 0.1 } });
+    expect(strict.withinTolerance).not.toBe(true);
+    expect(strict.findings.some(f => f.kind === 'layout' && !f.withinTolerance)).toBe(true);
+  });
+});
 
 /** The classic noisy element: a session badge whose accessible name churns on every run. */
 function sessionBadge(label: string | undefined, rect: Rect = { x: 10, y: 10, w: 60, h: 20 }): DomNode {
@@ -125,23 +324,40 @@ describe('ignoredNodes', () => {
 });
 
 describe('ignore and the a11y pass', () => {
-  // Identical screenshots: the only path to a finding is the pixel-free a11y pass.
   const image = () => solidImage(100, 100, WHITE);
+  // The a11y pass is pixel-*free*, not pixel-independent: it runs on a pair that moved pixels
+  // somewhere, and reports the regression that moved none of its own (D53). The corner square is
+  // that "somewhere", far from the badge whose label is what these tests are about.
+  const nudged = () => paintRect(solidImage(100, 100, WHITE), { x: 80, y: 80, w: 10, h: 10 }, RED);
   const before = () => side(image(), [body(), sessionBadge('Session 4f21')]);
-  const after = () => side(image(), [body(), sessionBadge(undefined)]);
+  const after = () => side(nudged(), [body(), sessionBadge(undefined)]);
 
   it('reports a lost accessible name when nothing is ignored', () => {
     const out = run(before(), after());
+    const a11y = out.diff.findings.filter((f) => f.kind === 'a11y');
+    expect(a11y).toHaveLength(1);
+    expect(a11y[0]?.severity).toBe('high');
+    expect(a11y[0]?.element?.selector).toBe('[data-test="session-id"]');
+    expect(a11y[0]?.region).toBeUndefined();
+  });
+
+  it('reports nothing at all when the two screenshots are identical', () => {
+    // The same lost accessible name, on a pair that rendered pixel-for-pixel the same. Findings
+    // are claims about a change the reader can be shown; there is nothing to show (D53).
+    const out = run(before(), side(image(), [body(), sessionBadge(undefined)]));
+    expect(out.diff.pixelChangedRatio).toBe(0);
+    expect(out.diff.findings).toEqual([]);
     expect(out.diff.regions).toEqual([]);
-    expect(out.diff.findings).toHaveLength(1);
-    expect(out.diff.findings[0]?.kind).toBe('a11y');
-    expect(out.diff.findings[0]?.severity).toBe('high');
-    expect(out.diff.findings[0]?.element?.selector).toBe('[data-test="session-id"]');
   });
 
   it('produces no finding at all for an ignored element whose label churns', () => {
+    // The pair moved pixels in the corner, so the a11y pass ran; the ignored badge contributed
+    // nothing to it. What survives is the corner square and only the corner square.
     const out = run(before(), after(), ['[data-test=session-id]']);
-    expect(out.diff.findings).toEqual([]);
+    expect(out.diff.findings.map((f) => f.element?.selector)).not.toContain(
+      '[data-test="session-id"]',
+    );
+    expect(out.diff.findings.every((f) => f.reasons.includes('pixels-only'))).toBe(true);
     expect(out.warnings).toEqual([]);
   });
 
@@ -181,11 +397,12 @@ describe('ignore and the a11y pass', () => {
     };
     const out = run(
       side(image(), [body(), sessionBadge('Session 4f21'), sibling('Pay now')]),
-      side(image(), [body(), sessionBadge(undefined), sibling(undefined)]),
+      side(nudged(), [body(), sessionBadge(undefined), sibling(undefined)]),
       ['[data-test=session-id]'],
     );
-    expect(out.diff.findings).toHaveLength(1);
-    expect(out.diff.findings[0]?.element?.selector).toBe('[data-test="pay"]');
+    const a11y = out.diff.findings.filter((f) => f.kind === 'a11y');
+    expect(a11y).toHaveLength(1);
+    expect(a11y[0]?.element?.selector).toBe('[data-test="pay"]');
   });
 });
 
@@ -211,7 +428,10 @@ describe('ignore and regions', () => {
     expect(reported.diff.findings.length).toBeGreaterThan(0);
 
     const ignored = run(base, head, ['[data-test=session-id]']);
-    expect(ignored.diff.pixelChangedRatio).toBeGreaterThan(0);
+    // Down to the reported number too (D56). It used to stay above zero — the regions and the
+    // findings were suppressed while the percentage still said the shot had changed, which under
+    // the pixel gate would carry the step past it as "changed, and here is no reason why".
+    expect(ignored.diff.pixelChangedRatio).toBe(0);
     expect(ignored.diff.regions).toEqual([]);
     expect(ignored.diff.findings).toEqual([]);
   });
@@ -340,5 +560,109 @@ describe('unsupported ignore selectors', () => {
     });
     expect(out.diff.missing).toBe('base');
     expect(out.warnings).toHaveLength(1);
+  });
+});
+
+describe('the emit switches (D54)', () => {
+  const nodes = (text: string): DomNode[] => [
+    body(),
+    domNode({
+      path: 'html>body>p',
+      parent: 'html>body',
+      tag: 'p',
+      rect: { x: 10, y: 10, w: 60, h: 20 },
+      text,
+    }),
+  ];
+  const changedPair = (): [ShotSide, ShotSide] => [
+    side(solidImage(100, 100, WHITE), nodes('Pay')),
+    side(paintRect(solidImage(100, 100, WHITE), { x: 10, y: 10, w: 60, h: 20 }, RED), nodes('Pay now')),
+  ];
+
+  function withOptions(emit: { emitFindings?: boolean; emitWarnings?: boolean }): ViewportDiffOutput {
+    const [base, head] = changedPair();
+    return diffViewport({
+      step: 'cart',
+      viewport: VIEWPORT,
+      base,
+      head,
+      options: defaultDiffOptions({
+        deviceScaleFactor: 1,
+        minRegionArea: 4,
+        ignore: ['div > .clock'],
+        ...emit,
+      }),
+    });
+  }
+
+  it('emits findings, regions and the overlay by default', () => {
+    const out = withOptions({});
+    expect(out.diff.findings.length).toBeGreaterThan(0);
+    expect(out.diff.regions.length).toBeGreaterThan(0);
+    expect(out.overlay).not.toBeNull();
+  });
+
+  it('keeps the pixel diff, the regions and the overlay with findings off', () => {
+    const out = withOptions({ emitFindings: false });
+    expect(out.diff.findings).toEqual([]);
+    expect(out.diff.pixelChangedRatio).toBeGreaterThan(0);
+    expect(out.diff.regions.length).toBeGreaterThan(0);
+    expect(out.overlay).not.toBeNull();
+    expect(out.regionSet).not.toBeNull();
+  });
+
+  it('drops the ignore-selector warning with warnings off, and keeps the findings', () => {
+    const out = withOptions({ emitWarnings: false });
+    expect(out.warnings).toEqual([]);
+    expect(out.diff.findings.length).toBeGreaterThan(0);
+    expect(withOptions({}).warnings).toHaveLength(1);
+  });
+});
+
+describe('the mask rects, with nothing painted over them (D56)', () => {
+  // What a `browser.mask: false` capture looks like to the engine: the shots differ where the
+  // clock ticked, and `dom.masks` still carries its rect.
+  const clockRect: Rect = { x: 10, y: 10, w: 60, h: 20 };
+
+  function ticking(text: string): DomNode[] {
+    return [
+      body(),
+      domNode({
+        path: 'html>body>time',
+        parent: 'html>body',
+        tag: 'time',
+        rect: clockRect,
+        text,
+      }),
+    ];
+  }
+
+  const before = (): ShotSide =>
+    side(solidImage(100, 100, WHITE), ticking('12:00:01'), [clockRect]);
+  const after = (): ShotSide =>
+    side(paintRect(solidImage(100, 100, WHITE), clockRect, RED), ticking('12:00:02'), [clockRect]);
+
+  it('keeps an unpainted mask out of the reported pixel change, and out of the findings', () => {
+    const out = run(before(), after());
+    expect(out.diff.pixelChangedRatio).toBe(0);
+    expect(out.diff.regions).toEqual([]);
+    expect(out.diff.findings).toEqual([]);
+  });
+
+  it('still reports a change beside it', () => {
+    const head = side(
+      paintRect(
+        paintRect(solidImage(100, 100, WHITE), clockRect, RED),
+        { x: 10, y: 60, w: 60, h: 20 },
+        RED,
+      ),
+      ticking('12:00:02'),
+      [clockRect],
+    );
+
+    const out = run(before(), head);
+    expect(out.diff.pixelChangedRatio).toBeGreaterThan(0);
+    expect(out.diff.regions.length).toBe(1);
+    expect(out.diff.regions[0]?.rect.y).toBeGreaterThanOrEqual(60);
   });
 });

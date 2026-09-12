@@ -85,6 +85,33 @@ jobs:
           # evidence travels as a workflow artifact and the comment links it — GitHub cannot render
           # an image out of an artifact.
           # publish-branch: visual-diff-reports
+
+          # linked | inline | both. \`inline\` embeds the report's images as data: URIs, so
+          # report.html alone is the whole report; \`both\` adds report.inline.html beside the
+          # linked page.
+          # html: linked
+
+          # Let a model write the review: the headline change, what is outside this pull request's
+          # description, what looks broken. Set ONE key from a repository secret; the provider is
+          # whichever key is present. Without a key the comment carries the numbers alone.
+          # anthropic-api-key: \${{ secrets.ANTHROPIC_API_KEY }}
+          # openai-api-key: \${{ secrets.OPENAI_API_KEY }}
+          # review-model: claude-opus-5
+
+          # Or keyless, through Anthropic Workload Identity Federation: the job's own GitHub identity
+          # is exchanged for a short-lived token. Register GitHub Actions as an issuer in the Claude
+          # Console (Settings → Workload identity → Connect workload), then name the rule here and add
+          # \`id-token: write\` to the permissions block above. No secret to store or rotate.
+          # anthropic-federation-rule-id: fdrl_...
+          # anthropic-organization-id: 00000000-0000-0000-0000-000000000000
+          # anthropic-service-account-id: svac_...
+          # anthropic-workspace-id: wrkspc_...   # only when the rule spans several workspaces
+
+          # Serve the exported report as a site. Point GitHub Pages at the publish branch (Settings →
+          # Pages → Deploy from a branch) and name the URL it serves; the comment's "Open the full
+          # report" then opens report.html for this pull request. Visibility follows the repository's
+          # Pages setting — private Pages on Enterprise Cloud, public otherwise.
+          # pages-url: https://<owner>.github.io/<repo>
 `;
 }
 

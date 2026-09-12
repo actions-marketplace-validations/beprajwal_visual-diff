@@ -122,6 +122,102 @@ Rejected: attach-only (cannot serve an old SHA, killing D3) and spawn with a liv
 diff polluted by current backend data). HAR freezes the network so diffs isolate code change. This
 layer is also the foundation of subsystem 2, so slice 1 pays for slice 2.
 
+**D53 — No pixel change, no findings.**
+A `(step, viewport)` pair whose two screenshots are identical reports nothing, and `stepsChanged`
+counts pixel movement rather than findings. Two paths could otherwise put a finding in front of a
+reader with no pixels behind it: the pixel-free a11y pass, and the page-size finding. A report that
+says "3 findings" beside two frames the reader can see are the same is a report that teaches them
+to distrust the count — the same cry-wolf failure §8's noise control exists to prevent, one layer
+up. A dimension change counts as pixel change: the image is a different size.
+
+Step-scoped findings — a new console error, a new request, a step that failed — are *not*
+suppressed by this rule. They are not claims about pixels, and losing a new console error because
+the frame looked the same would be the noise control eating the signal. What changes is the verdict
+attached to them: the step reads `identical` in the filmstrip and is not counted as changed, with
+the finding still listed and still counted.
+
+**D54 — Findings and warnings can be turned off; the pixel diff cannot.**
+`diff.findings: false` and `diff.warnings: false` in config.yaml, or `--no-findings` /
+`--no-warnings` on any command that resolves a pair, suppress the two report channels at the point
+they are emitted. The pixel diff, the regions, the overlays and the crops are computed and stored
+either way — a project that wants the pictures and not the list gets the pictures, and turning the
+list off is not a way to make the tool cheaper. Booleans, not levels: "which findings" is what
+`ignore`, `minRegionArea` and severity ordering are for, and a second, coarser filter over the same
+question is how two settings come to disagree about what the user asked for.
+
+The flag turns a channel off; there is no flag that turns one back on. A project that wrote
+`diff.findings: false` decided that for every invocation.
+
+Suppression is recorded in `findings.json` (`emit`), because an empty findings list has two causes
+that must never be confused: nothing was found, or nothing was looked for. The stored diff is not
+reused across that difference, `vdiff diff` says which channel is off, and the pull-request comment
+says so where it would otherwise print "No findings."
+
+**D55 — The mask paint is a setting, magenta by default.**
+A flow `mask` paints a solid rectangle over its selectors before capture, and the colour is
+magenta: a redaction bar has to be impossible to mistake for the UI, and this is evidence before it
+is a picture. But the screenshots are also what a reviewer looks at on a pull request, and on a
+flow that masks several elements the shot reads as a page of censorship bars. So
+`browser.maskColor` names the colour, and a project that sets it to its own page background gets a
+masked box that disappears into the page. What the diff needs is only that both sides paint the
+*same* colour; which colour that is belongs to whoever reads the pictures.
+
+It is validated at parse time rather than passed through to Playwright, because an unusable colour
+silently reverts to magenta at capture — a setting that appears to work and does nothing. And it is
+read from the working tree on both sides of a pair, like the session file is, so changing it
+repaints both sides at once. Changing it *between* a stored baseline and a new run does not: the
+old run keeps the old paint, and every masked rectangle is a change until the baseline is recaptured.
+
+**D56 — The mask can paint nothing, and the rects still hold.**
+`browser.mask: false` captures the page as it renders: no rectangle, no colour. What the masked
+selectors keep doing is the part that cannot be given up — their rects are excluded from the
+changed-pixel count, from the regions and from the findings — so a clock that ticks between two
+runs still says nothing about the change under review. Painting is presentation; excluding is the
+contract. `maskColor` together with `mask: false` is a config error rather than a preference
+quietly ignored.
+
+This is what forced `pixelChangedRatio` to become the count *outside* the exclusion rects. Until
+now a masked or ignored region was kept out of the clustering but left in the percentage — which
+nobody noticed, because a painted mask never differs. Unpainted, it differs on every run, and with
+D53 reading that number the step would be reported as "changed, 0.3% of pixels" with no region and
+no finding: a change the reviewer can neither act on nor dismiss. The same correction closes the
+hole for `ignore`, where the churn was always real.
+
+The denominator stays the whole compared area. "0.4% of pixels changed" is read against the shot in
+front of the reviewer, and a percentage whose denominator shrank as you masked more would climb
+while the page got quieter.
+
+**D57 — `diff.kinds` narrows which findings are emitted.**
+An allowlist over the closed kind vocabulary, every kind by default. This is the scalpel next to
+D54's blunt switch, and it exists because of how the blunt switch actually got used: the reason a
+project turns findings off is almost always *one channel*. Two replays of a pull request against a
+shared backend differ in their console output and their network traffic for reasons that have
+nothing to do with the change under review, and `findings: false` throws away the layout, style,
+content and accessibility findings — the ones no amount of backend noise can manufacture — to be
+rid of them.
+
+Kinds are filtered where findings are emitted, not where they are computed: attribution, node
+matching, the dedupe and the collapsed remainder are the stages that decide *what changed*, and
+which kinds a reader wants is not their business. An empty list is a config error naming
+`findings: false`, because "emit none of the kinds" already has a spelling.
+
+**D58 — `capture:` decides what a run collects at all.**
+`a11y`, `console` and `network`, each true by default, for two different reasons. The accessibility
+snapshot is *cost*: a round trip per shot per viewport, and nothing in the diff reads the file — the
+accessibility findings come from the roles and names already in `dom.json`, so `a11y.json` is an
+archive for a human, not an input. The other two are noise at its source: a project that has
+decided not to compare console output can stop recording it.
+
+Turning `console` or `network` off does not touch HAR record/replay or the hit/miss accounting.
+Those are how a replay is *served*; the JSON beside it is a diagnostic.
+
+What a run did not collect is stamped on the run (`meta.captured`), not merely implied by the
+config, because a diff reads two runs and neither one's configuration is a fact about the other:
+comparing a run that recorded its console against one that did not would report every line the base
+logged as `console error resolved` — a finding about the configuration, dressed as a fix. The engine
+folds an uncaptured channel into the same allowlist D57 stamps, so every sentence that already
+explains an absent kind explains this one too.
+
 ## 5. Architecture
 
 One npm package, `@beprajwal/visual-diff`, one binary, `vdiff`, with hard internal module seams
@@ -259,6 +355,8 @@ diff:
   maxRegions: 40
   antialiasTolerance: 0.1
   ignore: ["[data-test=session-id]"]
+  findings: true          # D54 — false emits the pixel diff and no findings
+  warnings: true          # D54 — false stores an empty warnings list
 network:
   redact: ["x-api-key"]
 retention:
@@ -409,6 +507,9 @@ orders the list and colors badges — it never hides anything.**
 A first-class feature, not a config afterthought: minimum region area, antialias tolerance, flow
 `mask`, and a config `ignore` selector list. A tool that cries wolf on every run gets turned off
 within a week.
+
+Two switches sit in front of all of it: a pair that rendered identically produces no findings at
+all (D53), and either report channel can be turned off outright (D54).
 
 ### Prose summaries belong to the agent
 

@@ -123,6 +123,38 @@ When `fail-on` is set and tripped, the action still uploads the artifact and pos
 fails at the end. A gate that fails first produces the worst possible artifact of this feature: a red
 check with no explanation of what changed.
 
+**D36 — `--html linked|inline|both` controls how the page addresses its images.**
+`linked` (the default) is the original shape: `report.html` points at `images/` with relative paths,
+smallest bundle, opens anywhere the directory travels whole. `inline` embeds every shown image as a
+`data:` URI, so the one file is the whole report — the shape for hosts that take single objects (a
+worker with an object store, a gist, an email) and for the workflow-artifact zip, where GitHub serves
+nothing as HTML anyway. `both` writes the linked page plus `report.inline.html` beside it. Only the
+page changes: `images/`, `comment.md` and the JSON are identical in every mode, and the inline page
+embeds exactly the shots `--images` selected — no more. Rejected: making `inline` the default, which
+would grow every bundle by a third (base64) to serve a case most workflows do not have.
+
+**D38 — `report.html` is the live report's UI over an embedded snapshot.**
+The bundle's page used to be a hand-rendered no-JS subset; reviewers got a different (and poorer)
+tool depending on where they opened the diff. Now `vdiff export` inlines the same Preact app
+`vdiff serve` mounts — filmstrip, side-by-side, overlay, swipe, keyboard — plus a JSON snapshot of
+the one exported pair, into a single file with no external request of any kind. An `ApiClient`
+implemented over the snapshot replaces fetch + SSE; feedback refuses with a sentence pointing at
+`vdiff serve`, and only the exported pair is answerable. `--html linked|inline` keeps its meaning —
+it decides whether the snapshot's image map holds relative paths into `images/` or `data:` URIs.
+Attribution annotations are not embedded (they live outside the DiffResult); the page renders
+without them exactly as the live report does when that fetch fails. A `<noscript>` block and
+`findings.json` remain the no-JS story. Rejected: keeping both renderers — two pages drift, and the
+static one always loses.
+
+**D37 — the comment shows the change, not the findings list.**
+The finding rows duplicated what the images already say, in the least readable form the comment had,
+and they crowded the images out of the byte budget. Dropped: the findings table and `--max-findings`.
+Kept: every number — the verdict line's severity counts, a findings-by-severity phrase in each image
+group's heading, and the per-step counts in the collapsed steps table. The full rows still ship in
+`findings.json` and render in the report page, which is where triage that needs ids and selectors
+happens anyway. Shrink order flips accordingly: the steps table is dropped before an image, because
+the images are now the comment's answer.
+
 ## 4. What CI adds, and what it does not
 
 A pull-request job produces exactly what a local `vdiff run`/`vdiff diff` pair produces, so
@@ -149,7 +181,8 @@ can be zipped, attached, served by any static host, or opened from a filesystem:
   summary.json           envelope: flow, pair, summary, labels, both runs' revision + env, generatedAt
   findings.json          the stored DiffResult, verbatim
   comment.md             the rendered markdown, with the image base it was rendered for
-  report.html            self-contained static page; relative image paths, no JS framework, no CDN
+  report.html            the interactive report over an embedded snapshot (D38); inline JS, no CDN
+  report.inline.html     under --html both: the same page with its images embedded (D36)
   images/
     <step>/<viewport>/base.png, head.png, pixel.png
     crops/<findingId>.png
@@ -168,21 +201,30 @@ One markdown document, in this order, so a reader who stops after two lines has 
 2. **Any pair label** — `cross-scenario`, `mock-vs-recorded`, `e2e-vs-replay`, variant pairings, and
    the degraded-detail sentences for an ingested side. These are the same sentences `vdiff diff`
    prints; a CI reader needs them more than a local one, not less.
-3. **Step table** — step, status, viewport, pixel change, findings.
-4. **Findings table** — id, severity, kind, where, element, change; capped with a stated remainder.
-5. **Images** — base / head / diff per changed step and viewport, only when an image base was given.
-6. **Footer** — artifact link, the exact `vdiff` commands to reproduce the pair locally, the version
+3. **What changed** — base / head / diff images per changed step and viewport, only when an image
+   base was given. This is the comment's answer (D37): each group's heading carries the pixel ratio
+   and a findings-by-severity phrase. There is no findings table — a reviewer triages from the
+   pictures and the counts, and the full rows live in `findings.json` and the report page.
+4. **Step table** — step, status, viewport, pixel change, findings; collapsed.
+5. **Footer** — artifact link, the exact `vdiff` commands to reproduce the pair locally, the version
    that produced it, and the marker comment.
 
 ## 7. CLI
 
 ```sh
 vdiff comment <flow> [base] [head] [--image-base <url>] [--artifact-url <url>]
-                                   [--max-findings <n>] [--max-images <n>]
+                                   [--max-images <n>] [--report-url <url>]
                                    [--fail-on none|high|any] [--out <file>] [--json]
 vdiff export  <flow> [base] [head] [--out <dir>] [--images changed|all|none] [--json]
+vdiff review  <flow> [base] [head] [--provider anthropic|openai] [--model <id>] [--shots <n>]
+                                   [--context <file>] [--out <file>] [--json]          (D39)
 vdiff install github-actions [--dir <path>] [--force] [--dry-run]
 ```
+
+`review` resolves its pair the same way, then asks the model whose API key the environment holds
+(`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) to read the diff, and stores `review.json` beside
+`findings.json`. `comment` and `export` pick a stored review up without a flag. No key is exit 2; a
+provider failure is exit 1.
 
 `comment` and `export` resolve their pair exactly as `diff` does — same defaults, same
 `--scenario`/`--variant`/`--e2e` narrowing, same store — because a pair that means one thing in
@@ -209,6 +251,11 @@ Exit codes: `0` success, `1` run or replay failure, `2` config or spec error, `3
 | `artifact` | `true` | upload the evidence bundle |
 | `artifact-name` | `visual-diff` | artifact name |
 | `publish-branch` | *(empty)* | branch to push diff images to, enabling inline images (D31) |
+| `pages-url` | *(empty)* | URL GitHub Pages serves `publish-branch` at; with it, the comment links `report.html` as a page (D40) |
+| `anthropic-api-key` | *(empty)* | a model writes the review the comment opens with; reaches the review step only (D39) |
+| `openai-api-key` | *(empty)* | the same, via OpenAI; Anthropic wins when both are set (D39) |
+| `review-model` | *(provider default)* | model id for the review |
+| `html` | `linked` | `linked` \| `inline` \| `both` — how the bundle's page addresses its images (D36) |
 | `node-version` | `20` | Node used to run `vdiff` |
 | `version` | *(the action's own version)* | `@beprajwal/visual-diff` version installed |
 | `working-directory` | `.` | directory holding `.visual-diff/` |
@@ -253,3 +300,237 @@ locally, mocking and variants made the runs worth comparing, e2e mode let an exi
 store, and this puts the result where the review already happens. What it deliberately leaves for
 later is the half of "CI mode" this slice refuses to guess at: an approval state that makes a
 findings count meaningful as a gate, and a hosted place for the evidence to live.
+
+## 12. Addendum (2026-09-07): a model in the reviewer's seat, and the report as a page
+
+Two decisions added after v0.8.0. Both are opt-in, both leave the defaults exactly as §3 describes
+them, and both were shaped by what turned out *not* to be possible.
+
+**What was asked for, and why it is not what shipped.** The request was to use an Anthropic or
+OpenAI API key in CI to publish the report the way the `visual-diff-report` skill does interactively —
+as a Claude artifact, or a ChatGPT Site. Neither has a programmatic path: Claude Code's artifact
+publishing requires a claude.ai session (an API-key session cannot publish, and artifacts are off by
+default in GitHub Action contexts), and ChatGPT Sites deploys only from the ChatGPT app, with no API,
+no CLI command and no `OPENAI_API_KEY` route. Those are the vendors' constraints, not ours, and the
+skill already says so. What an API key *can* do in CI is the one thing CI mode was missing.
+
+**D39 — With an API key present, a model writes the review; the CLI renders it, the action carries it.**
+Step 4 of the agent loop — "summarize the findings; call out anything you did not intend" — had no
+author in CI, so the comment was numbers. `vdiff review` puts a model in that seat: it sends the
+findings (paths and environments stripped, findings capped and the cap stated — D33's rule), the
+screenshots for the most important changed cells (worst finding first, then pixel movement; base,
+head, pixel diff and crops, each labelled), and — from the action, always — the pull request's title
+and body. The answer is a JSON schema both providers enforce strictly: a **headline** (the one change
+a ten-second reader must know), a summary, every change ranked and assessed `expected` /
+`unrelated` / `regression` / `unclear`, and **concerns**. `unrelated` is the point: a real change the
+description does not account for is the thing that should not have moved and did, and the comment
+opens with a warning block counting them. The provider is whichever key the environment holds
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; Anthropic when both), the model defaults to each provider's
+flagship and is overridable, and the call is one request over `fetch` — no SDK dependency for an
+optional feature an `npx` user may never touch, and `fetch` is injected in tests so the exact request
+shapes are pinned without a socket.
+
+What it deliberately is not: it is not a gate (`--fail-on` still counts findings), it is not an agent
+(one request, no tools, no retries that could double a bill), and it is not anonymous — `review.json`
+records provider, model and what the model was shown, and every rendering carries that line. It is
+stored beside `findings.json` under the same engine-version rule, so a review of a recomputed diff
+reads as absent; `comment` and `export` pick it up without a flag, the bundle carries `review.json`,
+and the page's snapshot renders it in its banner. Rejected: running a Claude Code or Codex agent in
+the action to do the same (heavier, slower, and still unable to publish); a flag on `comment` that
+calls the model at render time (two renderers, two bills, two possibly different reviews).
+
+This amends D29's "no HTTP client enters the package" in exactly one respect: `vdiff review` opens a
+socket to the model API the caller's key belongs to. The CLI still never talks to GitHub, and the
+action hands the model key to exactly one step — the drift test pins both.
+
+**D40 — The report becomes a site where the user already serves one.**
+D31 rejected GitHub Pages as a *default*; it remains right. But a repository that has nominated a
+`publish-branch` already has every pull request's `report.html` and images on a branch, and Pages
+can serve a branch. `pages-url` names the URL it does, and the action derives this pull request's
+prefix under it and passes `--report-url` to `comment`, so the "Open the full report" call to action
+opens the interactive page. Visibility is the repository's Pages setting — private to the
+organisation on Enterprise Cloud, public otherwise — which is the honest answer to "who can see it":
+the same people who can see the branch. No deploy action is used, because `actions/deploy-pages`
+replaces the whole site per run and would leave one pull request's report standing at a time.
+
+**The comment wears the mark.** Its heading now carries the product logo (served from this
+repository's `main`) and the name, so a pull request with several bots on it says whose comment this
+is before a number is read. The bundle's own `comment.md` is the one place an external URL now
+appears; the page and the images remain fully in-bundle, and the test that guarded that was made
+precise rather than removed.
+
+**D41 — A run can be told where the app is, without editing a committed file.**
+A repository's `config.yaml` names the origin its developers use — behind a local proxy, on a
+`.lvh.me` host, whatever their stack wants. CI fronts the same app on a different origin (a TLS
+proxy that makes it same-site with a real auth domain, say), and a historical replay reads its flow
+from git, so no edit to the working tree can reach the base side. `vdiff run` therefore takes
+`--base-url` and `--ready-on` — and, because the composite action calls it with no flags, reads
+`VDIFF_BASE_URL` and `VDIFF_READY_ON` from the environment as the fallback. Flag over environment
+over file. `browser.ignoreHTTPSErrors` (config) and `VDIFF_IGNORE_HTTPS_ERRORS` (environment) accept
+the proxy's self-signed certificate, in the browser and in the readiness probe alike — the probe
+moved off `fetch` for exactly that, since `fetch` cannot relax TLS for one request without a
+process-wide switch. Rejected: `${VAR}` templating inside `baseUrl` and `readyOn`, because it would
+change the spec's hash, could not reach a flow already in history, and would collide with the
+`$PORT` placeholder and the `${VAR}` fill values that already mean something else.
+
+**D42 — The recordings travel with the baseline.**
+HARs are gitignored on purpose (they are large and they are data), so a CI runner starts with none
+and a first run records against a live backend on both sides — correct, but exposed to backend
+drift between the two replays. The baseline cache now carries `.visual-diff/flows/*.har` beside
+`.visual-diff/runs`, under the same key: a baseline job records once, and a pull request that
+restores it replays the same traffic for its base and its head. A miss still records and still
+works; it is slower and noisier, never failed — the D32 posture, extended to the recording.
+
+**D43 — The review can run keyless: the runner's own identity, exchanged for a short-lived token.**
+A repository secret holding an Anthropic key is the thing Workload Identity Federation exists to
+remove, and a CI job is its canonical case. `vdiff review` now accepts Anthropic's three credentials
+in the SDK's own precedence — `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` (a bearer, which is
+what a federated `sk-ant-oat01-…` token is), then the federation variables
+(`ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID`,
+`ANTHROPIC_IDENTITY_TOKEN[_FILE]`, optional `ANTHROPIC_WORKSPACE_ID`) from which it mints the
+bearer itself with the RFC 7523 `jwt-bearer` grant at `/v1/oauth/token`. The action takes the
+federation ids as inputs (`anthropic-federation-rule-id` and friends), requests the GitHub OIDC
+token with audience `https://api.anthropic.com`, exchanges it **once** in its own step, masks the
+result and hands it to the review step as `ANTHROPIC_AUTH_TOKEN`. Once, because a GitHub identity
+token carries `jti` and is single-use: a job reviewing three flows would otherwise fail on the
+second exchange with `jti_reused`. The workflow needs `id-token: write`; the installed template says
+so. The OpenAI path is unchanged — it has no federation to speak of. The key still wins when both are
+configured, so a repository can migrate the way the WIF docs describe: set up federation beside the
+key, then delete the key.
+
+**D44 — `goto` paths take `${VAR}` references, and a reference may carry a default.**
+The first CI run of a real flow failed on its first step for a reason no design document had
+listed: the project ids in its `goto` paths were rows in one developer's local database. A flow
+that is committed and replayed on another machine — a colleague's, a runner's — needs its addresses
+to be parameters the same way its credentials already are. So `goto` resolves `${VAR}` exactly as
+`fill` does, and both accept the shell's `${VAR:-default}`, so a flow can name the local id as the
+default and let CI override it. Two asymmetries are deliberate: a default is never handed to the HAR
+scrubber (it is committed text, not a secret), and a `goto` value is never scrubbed at all (the
+resolved URL is what the recording must match). The structural diff still compares templates.
+Also from that run: `vdiff run` now prints *why* a step failed under the step table, and the action
+uploads the run directory when a replay fails, because a failure screenshot on a runner nobody can
+open is not evidence.
+
+**D45 — The per-action timeout is configurable, because CI is always cold.**
+The next thing the same CI run said, once it could say anything: `page.goto: Timeout 15000ms
+exceeded`. A warm `next dev` answers in a second; a cold one compiles the route on first hit, which
+the repository's own e2e configuration budgets at 10–30 seconds and multiplies by four for local
+servers. The replayer's 15-second default was tuned for the warm case and was not adjustable. Now it
+is: `app.stepTimeout: 60s` in `config.yaml`, `--step-timeout` on `vdiff run`, `VDIFF_STEP_TIMEOUT` in
+the environment for the action — the same flag-over-environment-over-file order as D41, and the same
+unit-required duration syntax as `readyTimeout`, because a bare `30` is ambiguous in exactly the way
+a unit exists to prevent. The default stays 15 seconds: a flow that needs longer on a warm server
+is a flow with a slow page, and the tool should keep saying so.
+
+**D46 — A recording is written entry by entry, never as one pretty-printed string.**
+The next failure in the same CI run was not the app's: `FATAL ERROR: Reached heap limit` inside
+`JSON.stringify`, five minutes in, after every step had replayed. A flow that drives a real
+application records hundreds of megabytes of responses, and the scrubber and the retargeter both
+re-serialised the whole document with two-space indentation — a string roughly twice the file, held
+in a heap that was already holding the parsed object. Nobody reads a recording; `routeFromHAR` does.
+So the HAR is now written compactly, one entry at a time, through a stream with backpressure
+(`writeHarFile`), and the two pure functions return the same compact layout. The action also gives
+the replay steps a 6 GB heap, because the parse itself still holds the document, and the runner has
+the memory. What this does not fix is the size of the recording; a `recordHar` that attaches bodies
+instead of embedding them is the next step if a flow outgrows even this.
+
+**D47 — A flow may `upload` a committed fixture, so it can create the state it captures.**
+The last two steps of the first real CI flow needed "a thread whose document is still parsing" —
+a row in one developer's database, which no environment variable can conjure elsewhere. The
+closed vocabulary gains one verb: `upload: { selector: path | [paths] }`, paths relative to
+`.visual-diff/` (a committed `fixtures/` directory, which `vdiff init`'s gitignore block now keeps),
+resolved on the replaying machine like the session file and refused if they escape the directory.
+The selector may be the `<input type=file>` itself — Playwright sets its files, hidden or not — or
+the button that opens the dialog, because assistant-style composers create their input on the fly
+and only the dialog is observable. With it, a flow attaches a fixture and captures the parsing state
+on the thread it just made, on whichever project it is pointed at. Data a flow can make is data no
+one has to seed.
+
+**D48 — The head side records; the base side replays.**
+The first pull-request-mode run replayed the head against the recording the base had just made,
+and failed the one step the pull request added: its new request had no answer in that recording,
+replay aborted it (D9 forbids falling through to the network), and the new list never rendered.
+That is the general case, not an accident — a change that adds or alters a request is precisely
+what a pull request is for. So the action's head run passes `--record`: the pull request's code
+reaches the live backend and records what it saw, while the base keeps replaying the cached
+baseline (D42), which is what makes the base deterministic across pull requests. `head-network:
+replay` is available for a flow whose traffic is known not to change. What is given up is
+same-traffic determinism between the two sides of one diff; what is kept is that the diff is
+about the change.
+
+**D43, amended — a denied exchange is a warning.** The first keyless run was denied (the rule
+trusted the branch subject; a job in a GitHub Environment presents `repo:<owner>/<repo>:environment:<name>`),
+and the mint step failed the job before the diff, the export and the comment ran. The review is the
+paragraph a credential buys; the evidence and the comment are what the job promises. So the mint
+step now warns, names the subject to check, and leaves the token empty; the review is skipped and
+the numbers-only comment goes out. Same posture as a failed `vdiff review`.
+
+**D49 — The comment is signed by a Visual Diff GitHub App when one is given.**
+The comment carried the mark and the name in its heading, but its author was whatever identity the
+token had — github-actions, or a person when the workflow was run with a personal token — and a
+reader scanning a pull request with four bots on it reads the avatar column first. GitHub attaches a
+name and an avatar to exactly one kind of automation identity: an App. So the action takes `app-id`
+and `app-private-key`, mints an installation token scoped to the repository
+(`actions/create-github-app-token`), and the two steps that talk to GitHub prefer it over
+`github-token`. Nothing is minted unless an app is named, and only in `pr` mode. The heading grew
+with it: a 32px mark on an h2 and the product name, with the flow and the pair on the line below.
+
+**D50 — On a private repository, Pages serves the comment's images.**
+The first publish against a private repository failed at the clone: the token rode only on the
+push, and an anonymous clone of a private repository is a username prompt, which is exit 128 on a
+runner. The token now rides on both. The second half is quieter: raw.githubusercontent.com answers a
+private repository's files only to a signed-in fetch, which an `<img>` in a comment is not, so the
+inline screenshots (D31) would render as broken images there. When `pages-url` is set the images
+come from the Pages site, which serves the same branch under the visibility the user chose when
+they set the URL (the organisation on Enterprise Cloud). Without Pages the raw URLs stay, which is
+right for a public repository and the documented limit for a private one.
+
+**D51 — The comment opens with a picture of the changes.**
+A comment that opens with a table is skimmed; one that opens with a screenshot is read — the
+recap tools that get read on pull requests all lead with one picture, in the reader's colour
+scheme, the whole picture a link. The first cut photographed the report page itself; the reviewer
+who asked for the picture did not want the tool in it — no filmstrip, no key bindings — but the
+changes: a numbered list, each with base and head side by side. So `vdiff export --preview` writes
+`preview.html`, a self-contained card (inline CSS, no script, images addressed relative to the
+bundle) listing the changed cells ranked additions and removals first, then by worst finding, then
+by pixels moved, capped at six with "and N more"; each entry names the step, the viewport, the kind
+of change, how much moved and the first finding, and shows the base and head captures beside each
+other — an added step's base pane says it is new, a removed step's head pane says it is gone. The
+command then photographs the card from the file, light and dark, full-page at 1200px wide, into
+`images/preview.png` and `images/preview-dark.png`. `vdiff comment --bundle <dir>` looks for those
+two files and, under the same `--image-base` rule as every other picture (D31), renders
+`<a href=report><picture><source dark><img light></picture></a>` right under the verdict, before
+the review and the step images. A machine without Chromium exports without a picture and says so;
+the action asks for one only when `publish-branch` gives it somewhere to be seen.
+
+**D49, amended — the app owns the comment.** The first run with the app configured would have
+edited the comment already on the thread, and an edit keeps its original author: the thread would
+still show github-actions (or the person whose token an earlier run used). So when the token is an
+app's and the comment found by its marker was posted by anyone else, it is deleted and posted again,
+once; from then on it is edited in place as before (D33). The card (D51) also lists a step once, at
+its widest viewport: the first real card spent its six entries on three steps twice over.
+
+**D49, amended again — the app signs the comment and nothing else.** The first run with the app
+configured minted its token and then failed the publish: the branch push used the app's token, and
+an app with only *pull requests* permission is told the repository does not exist. Giving the app
+*contents: write* would fix it and widen the blast radius of a leaked key for no visible gain — the
+reports branch does not care who its committer is. So the publish step keeps `github-token`, whose
+`contents: write` the workflow already grants, and the app's token reaches the comment step alone.
+
+**D50, amended — the images go through github.com, not Pages.** Serving the comment's images
+from the private Pages site did not render them either: GitHub rewrites every third-party image in
+a comment to its camo proxy, which fetches anonymously, and a private Pages site answers camo with
+a login page. The `/markdown` API shows the one form GitHub leaves alone:
+`https://github.com/<owner>/<repo>/raw/<branch>/<path>`. The reader's own signed-in browser fetches
+that, and GitHub signs the file for a private repository; on a public one it redirects to raw. So
+`image_base` is that form regardless of Pages, and Pages serves the report page alone (D40).
+
+**D52 — The Pages URL is asked for, not configured.**
+A private Pages site on Enterprise Cloud lives at a random subdomain (`<words>.pages.github.io`),
+and the first private deployment committed that string into a workflow file, where a reviewer
+rightly asked why. It is stable only for the life of the site — disable and re-enable Pages and it
+changes — and it is nothing a person should have to copy. The Pages API answers the question, so
+with `publish-branch` set and `pages-url` empty the action asks for the site and uses its URL when
+the site deploys from the publish branch. Anything else (no site, a site on another branch or built
+by a workflow, a token without `pages: read`) leaves the comment linking the artifact and says why in
+the log; nothing fails. `pages-url` stays as the override for a custom domain or an unreadable site.

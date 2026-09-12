@@ -147,6 +147,7 @@ describe('module edges', () => {
     expect(Object.keys(ports).sort()).toEqual([
       'adapterFiles',
       'adapterTargets',
+      'capturePreview',
       'computeDiff',
       'exportBundle',
       'ingestE2eTraces',
@@ -162,6 +163,7 @@ describe('module edges', () => {
       'planE2eIngest',
       'readInstalledVersion',
       'renderComment',
+      'requestReview',
       'runFlow',
       'scenarioFile',
       'scenariosDir',

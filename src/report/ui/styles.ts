@@ -302,6 +302,8 @@ select {
 .cell-badge.b-added { border-color: var(--added); color: var(--added); }
 .cell-badge.b-removed { border-style: dashed; }
 .cell-badge.b-identical { color: var(--identical); }
+.cell-badge.b-within-tolerance { color: var(--fg-dim); border-style: dotted; }
+.cell.v-within-tolerance .sub { color: var(--fg-dim); }
 
 /* ---------------------------------------------------------------- body layout */
 
@@ -505,6 +507,7 @@ select {
   white-space: nowrap;
 }
 .finding .label { flex: 1 1 auto; }
+.finding .tolerance-label { color: var(--fg-dim); font-size: 11px; margin-top: 3px; }
 .finding .caret { color: var(--fg-faint); }
 
 .changes {
@@ -646,7 +649,22 @@ select {
 }
 
 .tabs { display: flex; gap: 4px; }
-.legend { display: flex; gap: 8px; color: var(--fg-faint); flex-wrap: wrap; }
+.legend { display: flex; gap: 4px; color: var(--fg-faint); flex-wrap: wrap; }
+/* Every legend entry is the control it documents: a click does what the key does. */
+.legend button.legend-action {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-faint);
+  padding: 1px 6px;
+  font: inherit;
+}
+.legend button.legend-action:hover { background: var(--bg-hover); color: var(--fg-dim); }
+.legend button.legend-action[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.legend button.legend-action[aria-pressed="true"] kbd { color: inherit; border-color: currentColor; }
 .legend kbd {
   border: 1px solid var(--line-strong);
   border-bottom-width: 2px;

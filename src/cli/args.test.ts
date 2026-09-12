@@ -57,6 +57,28 @@ describe('parseArgs — the documented surface (spec §9)', () => {
       json: false,
     });
 
+    // Absent, not `false`: no switch was asked for, and the engine reads absent as "emit" (D54).
+    expect(ok(['diff', 'checkout', '--no-findings', '--no-warnings'])).toEqual({
+      kind: 'diff',
+      flow: 'checkout',
+      e2e: false,
+      json: false,
+      noFindings: true,
+      noWarnings: true,
+    });
+    expect(ok(['comment', 'checkout', '--no-findings'])).toMatchObject({
+      kind: 'comment',
+      noFindings: true,
+    });
+    expect(ok(['export', 'checkout', '--no-warnings'])).toMatchObject({
+      kind: 'export',
+      noWarnings: true,
+    });
+    expect(ok(['review', 'checkout', '--no-findings'])).toMatchObject({
+      kind: 'review',
+      noFindings: true,
+    });
+
     expect(ok(['serve'])).toEqual({ kind: 'serve', open: false, json: false });
     expect(ok(['feedback'])).toEqual({ kind: 'feedback', ack: false, json: false });
     expect(ok(['pin', '0007'])).toEqual({ kind: 'pin', runId: '0007', json: false });
@@ -180,7 +202,7 @@ describe('parseArgs — the documented surface (spec §9)', () => {
               ? ['install', 'claude-code', '--json']
               : command === 'e2e'
                 ? ['e2e', '--from', 'trace', 'trace.zip', '--json']
-                : ['run', 'runs', 'diff', 'comment', 'export'].includes(command)
+                : ['run', 'runs', 'diff', 'review', 'comment', 'export'].includes(command)
                   ? [command, 'checkout', '--json']
                   : [command, '--json'];
       expect(ok(argv).json, `${command} should accept --json`).toBe(true);
@@ -212,6 +234,37 @@ describe('parseArgs — the documented surface (spec §9)', () => {
       noScrub: true,
       json: true,
     });
+  });
+
+  it('parses comment --report-url', () => {
+    expect(ok(['comment', 'checkout', '--report-url', 'https://claude.ai/artifacts/abc'])).toMatchObject({
+      kind: 'comment',
+      reportUrl: 'https://claude.ai/artifacts/abc',
+    });
+  });
+
+  it('parses export --html and rejects an unknown mode', () => {
+    expect(ok(['export', 'checkout'])).toMatchObject({
+      kind: 'export',
+      images: 'changed',
+      html: 'linked',
+    });
+    expect(ok(['export', 'checkout', '--html', 'inline'])).toMatchObject({ html: 'inline' });
+    expect(ok(['export', 'checkout', '--html=both'])).toMatchObject({ html: 'both' });
+    expect(err(['export', 'checkout', '--html', 'fancy'])).toMatchObject({
+      code: 'invalid-html',
+      exitCode: EXIT.CONFIG_ERROR,
+    });
+  });
+
+  it('parses export --preview and comment --bundle (D51)', () => {
+    expect(ok(['export', 'checkout'])).toMatchObject({ preview: false });
+    expect(ok(['export', 'checkout', '--preview'])).toMatchObject({ preview: true });
+    expect(ok(['comment', 'checkout', '--bundle', 'out/checkout'])).toMatchObject({
+      kind: 'comment',
+      bundle: 'out/checkout',
+    });
+    expect(ok(['comment', 'checkout'])).not.toHaveProperty('bundle');
   });
 
   it('accepts a comma-separated viewport list and --flag=value form', () => {
@@ -828,5 +881,39 @@ describe('parseArgs — the --e2e timeline switch (e2e spec §6, D27)', () => {
       e2e: true,
       variant: 'none',
     });
+  });
+});
+
+describe('run — CI overrides (D41)', () => {
+  it('parses --base-url, --ready-on and --ignore-https-errors', () => {
+    expect(
+      ok([
+        'run',
+        'checkout',
+        '--base-url',
+        'https://ci.example.test/core',
+        '--ready-on',
+        'https://ci.example.test/core/403',
+        '--ignore-https-errors',
+      ]),
+    ).toMatchObject({
+      kind: 'run',
+      baseUrl: 'https://ci.example.test/core',
+      readyOn: 'https://ci.example.test/core/403',
+      ignoreHttpsErrors: true,
+    });
+    // Absent means absent — the file's values rule, and the command reads the environment.
+    const plain = ok(['run', 'checkout']);
+    expect('baseUrl' in plain).toBe(false);
+    expect('readyOn' in plain).toBe(false);
+    expect('ignoreHttpsErrors' in plain).toBe(false);
+  });
+});
+
+describe('run --step-timeout', () => {
+  it('parses a duration with a unit and refuses one without', () => {
+    expect(ok(['run', 'checkout', '--step-timeout', '90s'])).toMatchObject({ stepTimeoutMs: 90_000 });
+    expect(ok(['run', 'checkout', '--step-timeout', '2m'])).toMatchObject({ stepTimeoutMs: 120_000 });
+    expect(err(['run', 'checkout', '--step-timeout', '90'])).toMatchObject({ code: 'invalid-duration' });
   });
 });
