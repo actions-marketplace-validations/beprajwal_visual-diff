@@ -284,6 +284,26 @@ describe('planHar', () => {
     ).resolves.toEqual({ mode: 'record', path: har, recording: true });
   });
 
+  /*
+   * A job that passes `--record` for every flow it replays must not turn a mock flow into a
+   * recording one: mock declares there is no backend to record, carries no `har`, and the run
+   * would die on `har-path-missing` — which is how CI discovers it, one failed flow at a time.
+   */
+  it('leaves a mock flow on mock under a blanket --record', async () => {
+    const root = await tempRoot();
+    await expect(planHar(storeAt(root), spec({ mode: 'mock' }), runOptions('record'))).resolves.toEqual(
+      { mode: 'mock', recording: false },
+    );
+  });
+
+  it('still lets --no-net override a mock flow, which asks for less rather than more', async () => {
+    const root = await tempRoot();
+    await expect(planHar(storeAt(root), spec({ mode: 'mock' }), runOptions('off'))).resolves.toEqual({
+      mode: 'off',
+      recording: false,
+    });
+  });
+
   it('--no-net wins over a spec that would have replayed', async () => {
     const root = await tempRoot();
     await writeFile(paths.harFile(root, 'checkout.har'), '{}', 'utf8');
@@ -414,6 +434,25 @@ describe('planNetwork', () => {
     await expect(
       planNetwork(storeAt(root), spec({ mode: 'replay', har: 'checkout.har' }), runOptions(), overlay),
     ).resolves.toMatchObject({ mode: 'replay', recording: false });
+  });
+
+  /*
+   * The whole point of putting the scenario in the flow: CI names no scenario and passes --record
+   * once for the job. A mock flow has to survive that, or the arrangement only works for a caller
+   * who remembers to special-case it — which is the coupling the flow key exists to remove.
+   */
+  it('serves a mock flow under a blanket --record instead of calling it a mode conflict', async () => {
+    const root = await tempRoot();
+    await expect(
+      planNetwork(storeAt(root), spec({ mode: 'mock' }), runOptions('record'), mock),
+    ).resolves.toEqual({ mode: 'mock', recording: false });
+  });
+
+  it('still refuses a deliberate --no-net against a mock scenario, which is a real disagreement', async () => {
+    const root = await tempRoot();
+    await expect(
+      planNetwork(storeAt(root), spec({ mode: 'mock' }), runOptions('off'), mock),
+    ).rejects.toThrow(/scenario-mode-conflict|needs network mode/);
   });
 
   it('runs a mock scenario in mock mode even when the flow declares a HAR', async () => {

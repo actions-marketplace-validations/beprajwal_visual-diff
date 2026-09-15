@@ -422,10 +422,20 @@ async function bindServer(
   options: RunOptions,
 ): Promise<ServerBinding> {
   const config = store.config;
-  const configuredBase = options.baseUrl ?? spec.baseUrl ?? config.baseUrl;
+
   // The run's override wins over the file (CI spec D41): a runner fronting the dev server on
   // another origin says so once, for both sides of the diff, without touching a committed file.
-  const readyOn = options.readyOn ?? config.app.readyOn;
+  //
+  // Except for a `mode: mock` flow, whose backend is its scenario and whose assets native mock
+  // mode serves on loopback alone. A job-wide origin is not merely irrelevant there — it aims the
+  // flow at a host the scenario never answers for, and every request is aborted. The job sets that
+  // origin once for flows that need the real server; this keeps it off the flows that do not.
+  const jobOrigin = spec.network.mode !== 'mock';
+  const configuredBase = (jobOrigin ? options.baseUrl : undefined) ?? spec.baseUrl ?? config.baseUrl;
+  // The flow's own `readyOn` sits below the run override and above the project default: the route
+  // worth waiting on belongs to the flow that opens it.
+  const readyOn =
+    (jobOrigin ? options.readyOn : undefined) ?? spec.readyOn ?? config.app.readyOn;
   const insecureTls = options.ignoreHTTPSErrors ?? config.browser?.ignoreHTTPSErrors ?? false;
 
   if (target.mode === 'attach' && configuredBase !== undefined) {
@@ -472,8 +482,23 @@ export type HarPlan =
  * 0 misses. Reachable today by a flow declaring `network: { mode: off }` — which the flow validator
  * lets omit `har` — run with `--record`.
  */
+/**
+ * The network override this run honours, which is the caller's except over a mock flow asked to
+ * record.
+ *
+ * `mode: mock` states that the flow has no backend but its scenario: there is nothing to record and
+ * no `har` to record into. A job-wide `--record` — which CI passes once for every flow it replays —
+ * is not a claim about this flow, so honouring it would fail the run on `har-path-missing`, or on
+ * `scenario-mode-conflict` when a scenario is in play. A deliberate `--no-net` still applies: it
+ * asks for less access than mock, not more.
+ */
+export function networkOverride(spec: FlowSpec, options: RunOptions): NetworkMode | undefined {
+  if (spec.network.mode === 'mock' && options.network === 'record') return undefined;
+  return options.network;
+}
+
 export async function planHar(store: Store, spec: FlowSpec, options: RunOptions): Promise<HarPlan> {
-  const requested: NetworkMode = options.network ?? spec.network.mode;
+  const requested: NetworkMode = networkOverride(spec, options) ?? spec.network.mode;
   if (requested === 'off') return { mode: 'off', recording: false };
   // `mock` needs no HAR by construction (D13); what it needs instead — a scenario runtime — is
   // enforced where the context is opened, so there is still no path to the live network.
@@ -520,7 +545,7 @@ export async function planNetwork(
   if (scenario === undefined) return await planHar(store, spec, options);
 
   const requiredMode: NetworkMode = scenario.mode === 'mock' ? 'mock' : 'replay';
-  const override = options.network;
+  const override = networkOverride(spec, options);
   if (override !== undefined && override !== requiredMode) {
     throw new RunnerError({
       code: 'scenario-mode-conflict',
@@ -602,10 +627,15 @@ export async function runFlow(
     // The scenario is resolved before the network is planned, because it is the scenario that says
     // whether this run needs a recording at all (D13). On the slow path it is read out of git
     // history at the target SHA, exactly as the flow spec was (D4).
+    // The flow may name the scenario it is served by, and for `mode: mock` it effectively must:
+    // its only backend is the scenario's rules. The run option still wins, which is how one flow
+    // is captured against the empty, error or slow state without editing it. Read from the spec
+    // at the target SHA, so a historical replay uses the scenario that revision named.
     let scenario: ScenarioPlan | undefined;
-    if (options.scenario !== undefined) {
+    const scenarioName = options.scenario ?? spec.scenario;
+    if (scenarioName !== undefined) {
       scenario = await resolveScenario({
-        name: options.scenario,
+        name: scenarioName,
         root,
         gitRoot: target.gitRoot,
         ...(target.sha === undefined ? {} : { sha: target.sha }),

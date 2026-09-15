@@ -89,6 +89,9 @@ export const flowSpecSchema = z
     baseUrl: z.string().min(1).optional(),
     viewports: z.array(z.string().min(1)).min(1).optional(),
     network: zNetwork.optional(),
+    scenario: z.string().min(1).optional(),
+    readyOn: z.string().min(1).optional(),
+    ci: z.boolean().optional(),
     steps: z.array(zStep).min(1),
   })
   .strict();

@@ -131,6 +131,52 @@ steps:
     expect(result.value.baseUrl).toBeUndefined();
   });
 
+  it('carries the scenario, readiness route and discovery opt-out a flow declares', () => {
+    const result = parseFlowSource(
+      `version: 1
+flow: parsing
+baseUrl: http://127.0.0.1:3000/
+network: { mode: mock }
+scenario: parsing-midparse
+readyOn: http://127.0.0.1:3000/projects/p1/agent
+ci: false
+steps:
+  - id: home
+    goto: /
+    shoot: true
+`,
+      { file: 'parsing.yaml' },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.scenario).toBe('parsing-midparse');
+    expect(result.value.readyOn).toBe('http://127.0.0.1:3000/projects/p1/agent');
+    expect(result.value.ci).toBe(false);
+  });
+
+  it('leaves all three unset when the flow says nothing, so nothing changes for existing specs', () => {
+    const result = parseFlowSource(SPEC_EXAMPLE, { file: 'checkout.yaml' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.scenario).toBeUndefined();
+    expect(result.value.readyOn).toBeUndefined();
+    expect(result.value.ci).toBeUndefined();
+  });
+
+  it('refuses a non-boolean ci, which would otherwise read as opting out', () => {
+    const result = parseFlowSource(
+      `version: 1
+flow: parsing
+ci: 'false'
+steps:
+  - id: home
+    goto: /
+`,
+      { file: 'parsing.yaml' },
+    );
+    expect(result.ok).toBe(false);
+  });
+
   it('normalizes the singular shorthands for mask, expect and viewports', () => {
     const result = parseFlowSource(
       `version: 1

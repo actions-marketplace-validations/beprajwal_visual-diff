@@ -135,6 +135,27 @@ export interface FlowSpec {
   baseUrl?: string;
   viewports: ViewportId[];
   network: FlowNetwork;
+  /**
+   * The scenario this flow is captured under when none is named on the command line. A
+   * `mode: mock` flow has no backend but the scenario's rules, so the two belong in one file:
+   * declaring the mode here and passing the scenario separately lets a caller run the flow with
+   * neither, and every request is aborted. `--scenario` still overrides, which is how the same
+   * flow is captured against the empty or error state.
+   */
+  scenario?: ScenarioName;
+  /**
+   * Readiness probe for this flow, overriding `app.readyOn`. The route worth waiting on is the
+   * one the flow opens first — a property of the flow, not of the project — and on a cold dev
+   * server it is the difference between a step timeout and a capture.
+   */
+  readyOn?: string;
+  /**
+   * Whether automatic discovery includes this flow. `false` keeps a flow that cannot run
+   * unattended — one needing a seeded row, a fixture server, credentials no runner holds — out of
+   * the set the CI action replays when it is given no explicit list. It stays runnable by name,
+   * locally and in CI, so this excuses a flow from the default set rather than disabling it.
+   */
+  ci?: boolean;
   steps: Step[];
 }
 
