@@ -20,7 +20,7 @@ beforeEach(() => {
   git('config', 'user.email', 'test@example.test');
   git('config', 'user.name', 'Test');
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
 
 function release(version: string): string {
   writeFileSync(join(repo, 'package.json'), JSON.stringify({ version }));
