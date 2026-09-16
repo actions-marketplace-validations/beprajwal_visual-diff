@@ -51,9 +51,14 @@ export function envReferences(value: string): string[] {
 }
 
 /** The values of a flow that take references: every `fill` value and every `goto` path. */
-function referencingValues(flow: Pick<FlowSpec, 'steps'>): { fills: string[]; gotos: string[] } {
+function referencingValues(flow: EnvReferencingFlow): { fills: string[]; gotos: string[] } {
   const fills: string[] = [];
   const gotos: string[] = [];
+  // `baseUrl` and `readyOn` sit with the paths they are joined to: a flow whose origin carries the
+  // deployment's base path references the environment exactly as its `goto` steps do, and a
+  // reference the pre-flight check cannot see is one that fails mid-replay instead of before it.
+  if (flow.baseUrl !== undefined) gotos.push(flow.baseUrl);
+  if (flow.readyOn !== undefined) gotos.push(flow.readyOn);
   for (const step of flow.steps) {
     fills.push(...Object.values(step.fill ?? {}));
     if (step.goto !== undefined) gotos.push(step.goto);
@@ -61,8 +66,12 @@ function referencingValues(flow: Pick<FlowSpec, 'steps'>): { fills: string[]; go
   return { fills, gotos };
 }
 
+/** The parts of a flow spec that may reference the environment. */
+export type EnvReferencingFlow = Pick<FlowSpec, 'steps'> &
+  Partial<Pick<FlowSpec, 'baseUrl' | 'readyOn'>>;
+
 /** Every environment variable the flow references, `fill` values first, then `goto` paths. */
-export function flowEnvReferences(flow: Pick<FlowSpec, 'steps'>): string[] {
+export function flowEnvReferences(flow: EnvReferencingFlow): string[] {
   const names: string[] = [];
   const { fills, gotos } = referencingValues(flow);
   for (const value of [...fills, ...gotos]) {
@@ -79,7 +88,7 @@ export interface EnvResolution {
 }
 
 /** Resolve every reference the flow makes against `env`, without touching the flow. */
-export function resolveFlowEnv(flow: Pick<FlowSpec, 'steps'>, env: Env): EnvResolution {
+export function resolveFlowEnv(flow: EnvReferencingFlow, env: Env): EnvResolution {
   const values: string[] = [];
   const missing: string[] = [];
   const { fills, gotos } = referencingValues(flow);

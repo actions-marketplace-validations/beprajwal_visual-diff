@@ -99,3 +99,39 @@ describe('empty variables (D44)', () => {
     expect(interpolateEnv('a${X}b', { X: '' })).toBe('ab');
   });
 });
+
+/*
+ * The origin and the readiness probe reference the environment exactly as a `goto` does. This was
+ * a real failure: a flow whose `baseUrl` carried `${CORE_BASE_PATH}` passed `flow check`, then
+ * navigated to the literal string — "Cannot navigate to invalid URL" — because only `goto` and
+ * `fill` were ever interpolated, and the pre-flight missing-variable check could not see the rest.
+ */
+describe('references in the origin and the readiness probe', () => {
+  const addressed = {
+    baseUrl: 'http://127.0.0.1:3000${CORE_BASE_PATH}/',
+    readyOn: 'http://127.0.0.1:3000${CORE_BASE_PATH}/403',
+    steps: [{ id: 'home', goto: 'projects/${PROJECT}/home' }],
+  } as never;
+
+  it('reports what the origin and the probe reference, not only the steps', () => {
+    expect(flowEnvReferences(addressed)).toEqual(['CORE_BASE_PATH', 'PROJECT']);
+  });
+
+  it('counts an unset origin variable as missing before the replay starts', () => {
+    expect(resolveFlowEnv(addressed, { PROJECT: 'p1' }).missing).toEqual(['CORE_BASE_PATH']);
+  });
+
+  it('resolves an explicitly empty base path to the root, not to a default', () => {
+    expect(interpolateEnv(addressed.baseUrl, { CORE_BASE_PATH: '' })).toBe('http://127.0.0.1:3000/');
+  });
+
+  it('resolves a set base path into the origin', () => {
+    expect(interpolateEnv(addressed.baseUrl, { CORE_BASE_PATH: '/core' })).toBe(
+      'http://127.0.0.1:3000/core/',
+    );
+  });
+
+  it('does not treat a flow without either field as referencing anything', () => {
+    expect(flowEnvReferences({ steps: [{ id: 'home', goto: '/' }] } as never)).toEqual([]);
+  });
+});

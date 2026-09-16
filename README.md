@@ -325,6 +325,9 @@ gets a flow whose every request is aborted. Such a flow is also driven on loopba
 `VDIFF_BASE_URL` / `VDIFF_READY_ON` a runner sets for the real server are not applied to it, and a
 blanket `--record` leaves it on `mock` rather than asking a flow with no HAR to produce one.
 
+`baseUrl` and `readyOn` interpolate `${VAR}` as a `goto` does, so a flow can address both a
+deployment that serves the app under a base path and one that serves it at the root.
+
 `ci: false` excuses a flow from the default set without disabling it — for one that needs a seeded
 row, a fixture server, or credentials no runner holds. Naming it in the action's `flows:` input
 still runs it, and discovery says which flows it skipped.
