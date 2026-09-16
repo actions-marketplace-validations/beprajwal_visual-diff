@@ -311,6 +311,24 @@ steps:
     waitFor: "text=Payment"
 ```
 
+Three optional keys decide how a flow is run rather than what it does:
+
+```yaml
+scenario: checkout-empty   # the scenario serving this flow when none is named; --scenario wins
+readyOn: http://localhost:5173/cart   # what to wait for, overriding app.readyOn
+ci: false                  # keep this flow out of the CI action's automatic discovery
+```
+
+`scenario` matters most to a `mode: mock` flow, whose only backend is the scenario's rules: declare
+the mode in one file and pass the scenario somewhere else, and a caller who forgets the second half
+gets a flow whose every request is aborted. Such a flow is also driven on loopback, so the job-wide
+`VDIFF_BASE_URL` / `VDIFF_READY_ON` a runner sets for the real server are not applied to it, and a
+blanket `--record` leaves it on `mock` rather than asking a flow with no HAR to produce one.
+
+`ci: false` excuses a flow from the default set without disabling it — for one that needs a seeded
+row, a fixture server, or credentials no runner holds. Naming it in the action's `flows:` input
+still runs it, and discovery says which flows it skipped.
+
 A `mask` paints a solid rectangle over its selectors before the shot is taken, so a clock or an
 order id cannot make every run differ. Two settings in `config.yaml` decide how that looks:
 

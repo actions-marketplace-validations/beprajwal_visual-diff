@@ -25,7 +25,8 @@ branding:
 inputs:
   flows:
     description: >-
-      Whitespace-separated flow names. Empty means every flow in .visual-diff/flows.
+      Whitespace-separated flow names. Empty means every flow in .visual-diff/flows, except
+      those whose spec declares `ci: false`. Naming a flow here runs it either way.
     required: false
     default: ''
   mode:
@@ -153,7 +154,7 @@ inputs:
   version:
     description: 'Version of @beprajwal/visual-diff to install. Ignored when `cli` is set.'
     required: false
-    default: '0.19.4'
+    default: '0.20.0'
   cli:
     description: >-
       Command that invokes the CLI. Empty — the default — installs the package globally and calls
@@ -259,13 +260,28 @@ runs:
 
         # Flow names: whatever was asked for, or every spec on disk. A flow named but absent is an
         # error rather than a silently smaller run.
+        #
+        # Discovery skips a spec declaring `ci: false` — a flow that cannot run unattended here,
+        # needing a seeded row, a fixture server or credentials no runner holds. Naming it in
+        # `flows:` still runs it: the key excuses a flow from the default set, it does not disable
+        # it. Matched with grep rather than a parser because this runs before the CLI is installed;
+        # the key is validated properly by `vdiff flow check`.
         flows="$FLOWS_INPUT"
         if [ -z "${flows// }" ]; then
           flows=$(find .visual-diff/flows -maxdepth 1 -name '*.yaml' -exec basename {} .yaml \; 2>/dev/null | sort | tr '\n' ' ')
+          kept=''
+          for flow in $flows; do
+            if grep -qE '^ci:[[:space:]]*false[[:space:]]*(#.*)?$' ".visual-diff/flows/$flow.yaml"; then
+              echo "flow '$flow' declares ci: false — skipped by discovery"
+            else
+              kept="$kept $flow"
+            fi
+          done
+          flows="$kept"
         fi
         flows=$(echo "$flows" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
         if [ -z "$flows" ]; then
-          echo "::error::no flows found in .visual-diff/flows and none named via the flows input"
+          echo "::error::no flows to replay: none named via the flows input, and every spec in .visual-diff/flows is missing or declares ci: false"
           exit 2
         fi
         for flow in $flows; do

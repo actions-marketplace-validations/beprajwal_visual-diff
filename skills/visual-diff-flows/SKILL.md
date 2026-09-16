@@ -49,6 +49,23 @@ steps:
 `version: 1`, `flow` and `steps` are required; `baseUrl`, `viewports` and `network` fall back to
 `config.yaml`. `flow` should match the filename — a mismatch is a warning, not an error.
 
+Three more keys are optional and describe how the flow is run:
+
+| key | meaning |
+| --- | --- |
+| `scenario` | the scenario this flow is served by when none is named; `--scenario` overrides it |
+| `readyOn` | what to wait for before the first step, overriding `app.readyOn` |
+| `ci` | `false` keeps the flow out of the CI action's automatic discovery |
+
+Give a `mode: mock` flow its `scenario` here. Its only backend is that scenario's rules, so a flow
+declaring the mode without naming the scenario is one forgotten argument away from aborting every
+request it makes. Declaring it also tells the runner this flow is served locally: the job-wide
+`VDIFF_BASE_URL` / `VDIFF_READY_ON` are not applied to it, and a blanket `--record` leaves it alone.
+
+`ci: false` is for a flow that cannot run unattended — a seeded row, a fixture server, credentials
+no runner holds. It excuses the flow from the default set rather than disabling it: named in the
+action's `flows:` input, it still runs.
+
 ## The five rules that matter
 
 **1. `id` is permanent. Treat it as an identifier, not a label.**

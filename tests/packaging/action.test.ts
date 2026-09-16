@@ -13,7 +13,10 @@
  * only ones that take one.
  */
 
-import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parse as parseYaml } from 'yaml';
@@ -523,3 +526,100 @@ describe('the Pages site is asked for, not configured (D52)', () => {
     expect(publish?.env?.['PAGES_URL']).toBe('${{ inputs.pages-url || steps.pages.outputs.url }}');
   });
 });
+
+/* --------------------------------------------------- discovery and the ci opt-out (flow spec) */
+
+/**
+ * The resolve step decides which flows a job replays, and it runs before the CLI is installed —
+ * so it reads `ci: false` with grep rather than a parser. That makes it exactly the kind of code
+ * a reader approves and a typo defeats, and the failure is silent: a flow quietly absent from
+ * every run. These execute the step as written rather than asserting on its text.
+ */
+describe('the resolve step, run as written', () => {
+  async function resolveFlows(
+    specs: Record<string, string>,
+    flowsInput = '',
+  ): Promise<{ status: number | null; flows: string | undefined; stderr: string; stdout: string }> {
+    const action = parseYaml(await readFile(actionPath, 'utf8'))
+    const step = action.runs.steps.find((entry: { name?: string }) => entry.name === 'Resolve inputs')
+    expect(step, 'the action still has a step named "Resolve inputs"').toBeDefined()
+
+    const dir = await mkdtemp(join(tmpdir(), 'vdiff-resolve-'))
+    try {
+      await mkdir(join(dir, '.visual-diff', 'flows'), { recursive: true })
+      await writeFile(join(dir, '.visual-diff', 'config.yaml'), 'version: 1\n', 'utf8')
+      for (const [name, body] of Object.entries(specs)) {
+        await writeFile(join(dir, '.visual-diff', 'flows', `${name}.yaml`), body, 'utf8')
+      }
+      const outputs = join(dir, 'outputs.txt')
+      await writeFile(outputs, '', 'utf8')
+
+      const result = spawnSync('bash', ['-c', step.run], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          MODE: 'baseline',
+          BASELINE: 'auto',
+          FAIL_ON: 'none',
+          IMAGES: 'changed',
+          HEAD_NETWORK: 'replay',
+          PAGES_URL: '',
+          PUBLISH_BRANCH: '',
+          FLOWS_INPUT: flowsInput,
+          GITHUB_OUTPUT: outputs,
+          RUNNER_TEMP: dir,
+        },
+      })
+      const written = await readFile(outputs, 'utf8')
+      const line = written.split('\n').find((entry) => entry.startsWith('flows='))
+      return {
+        status: result.status,
+        flows: line?.slice('flows='.length),
+        stderr: result.stderr,
+        stdout: result.stdout,
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+
+  const mock = (name: string, ci?: boolean) =>
+    `version: 1\nflow: ${name}\nnetwork: { mode: mock }\n${ci === undefined ? '' : `ci: ${ci}\n`}steps:\n  - id: home\n    goto: /\n`
+
+  it('discovers every flow that does not opt out', async () => {
+    const result = await resolveFlows({
+      alpha: mock('alpha'),
+      beta: mock('beta', true),
+      gamma: mock('gamma', false),
+    })
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.flows).toBe('alpha beta')
+  })
+
+  it('says which flow it skipped, so an absent flow is never silent', async () => {
+    const result = await resolveFlows({ alpha: mock('alpha'), gamma: mock('gamma', false) })
+    expect(result.stdout).toContain("flow 'gamma' declares ci: false")
+  })
+
+  it('runs an opted-out flow when it is named, because the key excuses it from the default set', async () => {
+    const result = await resolveFlows({ gamma: mock('gamma', false) }, 'gamma')
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.flows).toBe('gamma')
+  })
+
+  it('fails rather than replaying nothing when every flow opts out', async () => {
+    const result = await resolveFlows({ gamma: mock('gamma', false) })
+    expect(result.status).toBe(2)
+    expect(result.stdout + result.stderr).toContain('no flows to replay')
+  })
+
+  it('does not mistake a commented or quoted ci for the key itself', async () => {
+    const result = await resolveFlows({
+      alpha: `version: 1\nflow: alpha\n# ci: false — described, not declared\nsteps:\n  - id: home\n    goto: /\n`,
+      beta: `version: 1\nflow: beta\ndescription: "ci: false"\nsteps:\n  - id: home\n    goto: /\n`,
+    })
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.flows).toBe('alpha beta')
+  })
+})

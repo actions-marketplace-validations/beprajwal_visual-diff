@@ -16,6 +16,7 @@ import {
   STEP_VERBS,
   type FlowNetwork,
   type FlowSpec,
+  type ScenarioName,
   type SourceLocation,
   type Step,
   type ValidationIssue,
@@ -129,6 +130,9 @@ function withDefaults(input: FlowSpecInput): FlowSpec {
     steps: input.steps.map(normalizeStep),
   };
   if (input.baseUrl !== undefined) spec.baseUrl = input.baseUrl;
+  if (input.scenario !== undefined) spec.scenario = input.scenario as ScenarioName;
+  if (input.readyOn !== undefined) spec.readyOn = input.readyOn;
+  if (input.ci !== undefined) spec.ci = input.ci;
   return spec;
 }
 
