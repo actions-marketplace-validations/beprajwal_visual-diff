@@ -107,8 +107,9 @@ describe('empty variables (D44)', () => {
  * `fill` were ever interpolated, and the pre-flight missing-variable check could not see the rest.
  */
 describe('references in the origin and the readiness probe', () => {
+  const baseUrl = 'http://127.0.0.1:3000${CORE_BASE_PATH}/';
   const addressed = {
-    baseUrl: 'http://127.0.0.1:3000${CORE_BASE_PATH}/',
+    baseUrl,
     readyOn: 'http://127.0.0.1:3000${CORE_BASE_PATH}/403',
     steps: [{ id: 'home', goto: 'projects/${PROJECT}/home' }],
   } as never;
@@ -122,11 +123,11 @@ describe('references in the origin and the readiness probe', () => {
   });
 
   it('resolves an explicitly empty base path to the root, not to a default', () => {
-    expect(interpolateEnv(addressed.baseUrl, { CORE_BASE_PATH: '' })).toBe('http://127.0.0.1:3000/');
+    expect(interpolateEnv(baseUrl, { CORE_BASE_PATH: '' })).toBe('http://127.0.0.1:3000/');
   });
 
   it('resolves a set base path into the origin', () => {
-    expect(interpolateEnv(addressed.baseUrl, { CORE_BASE_PATH: '/core' })).toBe(
+    expect(interpolateEnv(baseUrl, { CORE_BASE_PATH: '/core' })).toBe(
       'http://127.0.0.1:3000/core/',
     );
   });
