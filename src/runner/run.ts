@@ -61,7 +61,7 @@ import {
   type DevServerHandle,
 } from './devserver.js';
 import { RunnerError, errorMessage } from './errors.js';
-import { resolveFlowEnv } from './env-template.js';
+import { interpolateEnv, resolveFlowEnv } from './env-template.js';
 import { indexHarFile, retargetHarFile, scrubHarFile, type HarIndex } from './har.js';
 import { readGitStateSafe, repoRoot, resolveRef, sameGitState, showFileAtRev, toRevision } from './git.js';
 import { replayViewport, selectorOf, type StepOutcome, type ViewportReplay } from './replay.js';
@@ -409,6 +409,11 @@ function parseSpec(source: string, file: string, flow: string): FlowSpec {
   return parsed.value;
 }
 
+/** `${VAR}` in an origin, resolved as a `goto` path's references are. */
+function envUrl(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : interpolateEnv(value, process.env);
+}
+
 interface ServerBinding {
   mode: RunMode;
   baseUrl: string;
@@ -431,11 +436,18 @@ async function bindServer(
   // flow at a host the scenario never answers for, and every request is aborted. The job sets that
   // origin once for flows that need the real server; this keeps it off the flows that do not.
   const jobOrigin = spec.network.mode !== 'mock';
-  const configuredBase = (jobOrigin ? options.baseUrl : undefined) ?? spec.baseUrl ?? config.baseUrl;
+  // Both are interpolated like a `goto` path: one deployment serves the app under a base path and
+  // another at the root, and a flow naming that path in its origin has to say so the way its steps
+  // already do.
+  const configuredBase = envUrl(
+    (jobOrigin ? options.baseUrl : undefined) ?? spec.baseUrl ?? config.baseUrl,
+  );
   // The flow's own `readyOn` sits below the run override and above the project default: the route
   // worth waiting on belongs to the flow that opens it.
-  const readyOn =
-    (jobOrigin ? options.readyOn : undefined) ?? spec.readyOn ?? config.app.readyOn;
+  const readyOn = interpolateEnv(
+    (jobOrigin ? options.readyOn : undefined) ?? spec.readyOn ?? config.app.readyOn,
+    process.env,
+  );
   const insecureTls = options.ignoreHTTPSErrors ?? config.browser?.ignoreHTTPSErrors ?? false;
 
   if (target.mode === 'attach' && configuredBase !== undefined) {

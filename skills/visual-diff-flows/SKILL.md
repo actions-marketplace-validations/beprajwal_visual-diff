@@ -62,6 +62,12 @@ declaring the mode without naming the scenario is one forgotten argument away fr
 request it makes. Declaring it also tells the runner this flow is served locally: the job-wide
 `VDIFF_BASE_URL` / `VDIFF_READY_ON` are not applied to it, and a blanket `--record` leaves it alone.
 
+`baseUrl` and `readyOn` interpolate `${VAR}` the way a `goto` does, so one flow can address a
+deployment that serves the app under a base path and one that serves it at the root:
+`http://127.0.0.1:3000${CORE_BASE_PATH}/`. An unset variable is named as missing before the replay
+starts rather than becoming a literal in the URL; `${VAR:-/default}` supplies a fallback, and an
+explicitly empty variable resolves to empty.
+
 `ci: false` is for a flow that cannot run unattended — a seeded row, a fixture server, credentials
 no runner holds. It excuses the flow from the default set rather than disabling it: named in the
 action's `flows:` input, it still runs.
